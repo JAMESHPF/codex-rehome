@@ -1039,15 +1039,25 @@ fn copy_directory_tree(source: &Path, destination: &Path) -> Result<(), RehomeEr
                 restore_failed(format!("could not preserve directory permissions: {error}"))
             })?;
         } else if metadata.is_file() {
-            fs::copy(entry.path(), &target).map_err(|error| {
-                restore_failed(format!("could not copy directory backup file: {error}"))
+            let mut source = fs::File::open(entry.path()).map_err(|error| {
+                restore_failed(format!("could not open directory backup source: {error}"))
             })?;
-            let file = fs::OpenOptions::new()
-                .read(true)
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
                 .open(&target)
                 .map_err(|error| restore_failed(format!("could not open backup file: {error}")))?;
+            io::copy(&mut source, &mut file).map_err(|error| {
+                restore_failed(format!("could not copy directory backup file: {error}"))
+            })?;
             file.sync_all()
                 .map_err(|error| restore_failed(format!("could not flush backup file: {error}")))?;
+            drop(file);
+            fs::set_permissions(&target, metadata.permissions()).map_err(|error| {
+                restore_failed(format!(
+                    "could not preserve backup file permissions: {error}"
+                ))
+            })?;
         } else {
             return Err(restore_failed(
                 "directory backup source contains a special filesystem entry",
