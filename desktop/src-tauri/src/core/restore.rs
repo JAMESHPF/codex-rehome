@@ -1256,7 +1256,9 @@ mod fault_injection_tests {
         ] {
             let temp = tempfile::tempdir().unwrap();
             let root = fs::canonicalize(temp.path()).unwrap();
-            env::set_var("LOCALAPPDATA", root.join("app-data"));
+            let app_data = tempfile::tempdir().unwrap();
+            let app_data_root = fs::canonicalize(app_data.path()).unwrap();
+            env::set_var("LOCALAPPDATA", &app_data_root);
             let (plan, target_skill, target_lock, original_lock) = fault_fixture(&root);
             let options = RestoreOptions {
                 codex_closed_confirmed: true,
@@ -1301,8 +1303,7 @@ mod fault_injection_tests {
                 "{point:?}: {leftovers:?}"
             );
             assert!(leftovers.len() <= 1, "{point:?}: {leftovers:?}");
-            let transactions = root
-                .join("app-data")
+            let transactions = app_data_root
                 .join("com.rehome.desktop")
                 .join("transactions");
             let journal_path = fs::read_dir(transactions)
