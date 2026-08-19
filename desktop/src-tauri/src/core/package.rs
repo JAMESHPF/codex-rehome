@@ -1698,7 +1698,7 @@ fn validate_shared_skill_manifest(
                 "shared Skill manifest counts or SKILL.md marker do not match payloads",
             ));
         }
-        let actual_tree_hash = tree_hash_from_payload_records(records.into_iter())
+        let actual_tree_hash = tree_hash_from_payload_records(records)
             .map_err(|error| package_invalid(error.message))?;
         if !actual_tree_hash.eq_ignore_ascii_case(&skill.tree_hash) {
             return Err(package_invalid(
