@@ -1102,6 +1102,8 @@ fn maps_project_targets_with_the_target_operating_system_syntax() -> Result<(), 
         target_os: SourceOs,
         codex_home: &'static str,
         projects_root: &'static str,
+        agents_skills_root: &'static str,
+        skill_lock_path: &'static str,
         expected_target: &'static str,
     }
 
@@ -1110,12 +1112,16 @@ fn maps_project_targets_with_the_target_operating_system_syntax() -> Result<(), 
             target_os: SourceOs::Windows,
             codex_home: r"C:\Users\test\.codex",
             projects_root: r"D:\ReHome",
+            agents_skills_root: r"C:\Users\test\.agents\skills",
+            skill_lock_path: r"C:\Users\test\.agents\.skill-lock.json",
             expected_target: r"D:\ReHome\visual\README.md",
         },
         Case {
             target_os: SourceOs::Macos,
             codex_home: "/Users/test/.codex",
             projects_root: "/Users/test/Codex-Restored-Projects",
+            agents_skills_root: "/Users/test/.agents/skills",
+            skill_lock_path: "/Users/test/.agents/.skill-lock.json",
             expected_target: "/Users/test/Codex-Restored-Projects/visual/README.md",
         },
     ] {
@@ -1123,8 +1129,8 @@ fn maps_project_targets_with_the_target_operating_system_syntax() -> Result<(), 
         let preview = project_only_preview(temp.path())?;
         let target = TargetInventory {
             codex_home: PathBuf::from(case.codex_home),
-            agents_skills_root: test_agents_skills_root(case.target_os),
-            skill_lock_path: test_skill_lock_path(case.target_os),
+            agents_skills_root: PathBuf::from(case.agents_skills_root),
+            skill_lock_path: PathBuf::from(case.skill_lock_path),
             target_os: case.target_os,
             target_arch: "x86_64".into(),
             counts: ContentCounts::default(),
@@ -1274,8 +1280,8 @@ fn macos_project_target_names_use_case_insensitive_unicode_collision_rules(
         preview = inspect_package(&preview.package_path)?;
         let target = TargetInventory {
             codex_home: PathBuf::from("/Users/test/.codex"),
-            agents_skills_root: test_agents_skills_root(SourceOs::Macos),
-            skill_lock_path: test_skill_lock_path(SourceOs::Macos),
+            agents_skills_root: PathBuf::from("/Users/test/.agents/skills"),
+            skill_lock_path: PathBuf::from("/Users/test/.agents/.skill-lock.json"),
             target_os: SourceOs::Macos,
             target_arch: "aarch64".into(),
             counts: ContentCounts::default(),
