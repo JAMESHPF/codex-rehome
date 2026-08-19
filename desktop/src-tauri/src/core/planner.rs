@@ -1,12 +1,13 @@
 use crate::core::{
     error::{ErrorCode, RehomeError},
     models::{
-        BridgeVerificationRequirements, ChangeKind, FileConflictResolution, PackagePreview,
-        PlannedOperation, PlannedSession, ReferenceRewrite, ReferenceRewriteKind, RestorePlan,
-        SessionAction, SourceOs, TargetInventory,
+        BridgeVerificationRequirements, ChangeKind, FileConflictResolution, OperationKind,
+        PackagePreview, PlannedOperation, PlannedSession, ReferenceRewrite, ReferenceRewriteKind,
+        RestorePlan, RestoreRootKind, SessionAction, SkillLockFileV3, SourceOs, TargetInventory,
     },
     package::{inspect_package_for_planning, VerifiedPayload},
     paths::normalize_entry,
+    shared_skills::{merge_skill_lock, tree_hash, LockMergeResult},
 };
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use sha2::{Digest, Sha256};
@@ -70,10 +71,37 @@ pub fn build_restore_plan_with_conflict_resolution(
     projects_root: &Path,
     conflict_resolution: Option<FileConflictResolution>,
 ) -> Result<RestorePlan, RehomeError> {
+    build_restore_plan_with_skill_resolutions(
+        package,
+        target,
+        projects_root,
+        conflict_resolution,
+        &BTreeMap::new(),
+    )
+}
+
+pub fn build_restore_plan_with_skill_resolutions(
+    package: &PackagePreview,
+    target: &TargetInventory,
+    projects_root: &Path,
+    conflict_resolution: Option<FileConflictResolution>,
+    skill_resolutions: &BTreeMap<Uuid, FileConflictResolution>,
+) -> Result<RestorePlan, RehomeError> {
     validate_plan_inputs(package, target, projects_root)?;
     validate_root_ancestry(&target.codex_home, target.target_os)?;
     validate_root_ancestry(projects_root, target.target_os)?;
     validate_root_separation(&target.codex_home, projects_root, target.target_os)?;
+    validate_root_ancestry(&target.agents_skills_root, target.target_os)?;
+    validate_root_separation(
+        &target.codex_home,
+        &target.agents_skills_root,
+        target.target_os,
+    )?;
+    validate_root_separation(projects_root, &target.agents_skills_root, target.target_os)?;
+    let lock_parent = portable_target_parent(&target.skill_lock_path, target.target_os)?;
+    validate_root_ancestry(&lock_parent, target.target_os)?;
+    validate_root_separation(&target.codex_home, &lock_parent, target.target_os)?;
+    validate_root_separation(projects_root, &lock_parent, target.target_os)?;
     let verified = inspect_package_for_planning(&package.package_path)?;
     if verified.preview != *package {
         return Err(package_invalid(
@@ -102,13 +130,41 @@ pub fn build_restore_plan_with_conflict_resolution(
                 .strip_prefix(&prefix)
                 .ok_or_else(|| package_invalid("project payload path is malformed"))?;
             let target_path = join_target(&target_root, relative, target.target_os)?;
-            operations.push(classify_file(
+            let mut operation = classify_file(
                 source,
                 target_path,
                 payload,
                 target.target_os,
                 conflict_resolution,
-            )?);
+            )?;
+            operation.root_kind = RestoreRootKind::Projects;
+            operations.push(operation);
+            consumed.insert(source.clone());
+        }
+    }
+
+    for skill in &package.manifest.shared_skills {
+        let target_path = resolve_skill_target(
+            &target.agents_skills_root,
+            &skill.relative_path,
+            target.target_os,
+        )?;
+        let resolution = skill_resolutions.get(&skill.content_id).copied();
+        let (action, expected_previous_hash) =
+            classify_skill_bundle(&target_path, &skill.tree_hash, resolution, target.target_os)?;
+        operations.push(PlannedOperation {
+            package_source: skill.archive_root.clone(),
+            target: target_path,
+            expected_previous_hash,
+            action,
+            rollback_required: matches!(action, ChangeKind::Add | ChangeKind::Update),
+            root_kind: RestoreRootKind::AgentsSkills,
+            operation_kind: OperationKind::SkillBundle,
+            content_id: Some(skill.content_id),
+            expected_final_hash: Some(skill.tree_hash.clone()),
+        });
+        let prefix = format!("{}/", skill.archive_root);
+        for source in payloads.keys().filter(|source| source.starts_with(&prefix)) {
             consumed.insert(source.clone());
         }
     }
@@ -242,6 +298,10 @@ pub fn build_restore_plan_with_conflict_resolution(
             expected_previous_hash,
             action: change,
             rollback_required,
+            root_kind: crate::core::models::RestoreRootKind::CodexHome,
+            operation_kind: crate::core::models::OperationKind::File,
+            content_id: None,
+            expected_final_hash: Some(expected_final_content_hash.clone()),
         });
         sessions.push(PlannedSession {
             package_source: conversation.archive_path.clone(),
@@ -321,6 +381,34 @@ pub fn build_restore_plan_with_conflict_resolution(
         }
     }
 
+    if let Some(lock_metadata) = package.manifest.shared_skill_lock.as_ref() {
+        let package_lock_bytes =
+            verified.authenticated_planning_payload(&lock_metadata.archive_path)?;
+        let package_lock: SkillLockFileV3 = serde_json::from_slice(package_lock_bytes)
+            .map_err(|_| package_invalid("verified shared Skill lock is invalid"))?;
+        let decisions = package
+            .manifest
+            .shared_skills
+            .iter()
+            .map(|skill| {
+                let action = operations
+                    .iter()
+                    .find(|operation| operation.content_id == Some(skill.content_id))
+                    .map(|operation| operation.action)
+                    .ok_or_else(|| restore_failed("shared Skill bundle decision is missing"))?;
+                Ok((skill.relative_path.clone(), action))
+            })
+            .collect::<Result<BTreeMap<_, _>, RehomeError>>()?;
+        operations.push(plan_skill_lock_operation(
+            &lock_metadata.archive_path,
+            &target.skill_lock_path,
+            &package_lock,
+            &decisions,
+            target.target_os,
+        )?);
+        consumed.insert(lock_metadata.archive_path.clone());
+    }
+
     for (source, payload) in payloads {
         if consumed.contains(source) || is_package_only_metadata(source) {
             continue;
@@ -343,10 +431,12 @@ pub fn build_restore_plan_with_conflict_resolution(
 
     operations.sort_by(|left, right| left.package_source.cmp(&right.package_source));
     sessions.sort_by_key(|session| session.source_task_id);
-    validate_final_targets(
+    validate_final_targets_with_agents(
         &operations,
         &target.codex_home,
         projects_root,
+        &target.agents_skills_root,
+        &target.skill_lock_path,
         target.target_os,
     )?;
     let reference_rewrites = rewrites.into_values().collect::<Vec<_>>();
@@ -357,10 +447,26 @@ pub fn build_restore_plan_with_conflict_resolution(
     let required_bytes = operations
         .iter()
         .filter(|operation| matches!(operation.action, ChangeKind::Add | ChangeKind::Update))
-        .filter_map(|operation| payloads.get(&operation.package_source))
-        .try_fold(0_u64, |total, payload| {
+        .try_fold(0_u64, |total, operation| {
+            let bytes = match operation.operation_kind {
+                OperationKind::File | OperationKind::SkillLock => payloads
+                    .get(&operation.package_source)
+                    .map(|payload| payload.size_bytes)
+                    .unwrap_or(0),
+                OperationKind::SkillBundle => operation
+                    .content_id
+                    .and_then(|content_id| {
+                        package
+                            .manifest
+                            .shared_skills
+                            .iter()
+                            .find(|skill| skill.content_id == content_id)
+                    })
+                    .map(|skill| skill.content_bytes)
+                    .unwrap_or(0),
+            };
             total
-                .checked_add(payload.size_bytes)
+                .checked_add(bytes)
                 .ok_or_else(|| restore_failed("restore plan size exceeds the supported range"))
         })?;
 
@@ -371,6 +477,8 @@ pub fn build_restore_plan_with_conflict_resolution(
         archive_hash: package.archive_hash.clone(),
         target_codex_home: target.codex_home.clone(),
         projects_root: projects_root.to_path_buf(),
+        target_agents_skills_root: target.agents_skills_root.clone(),
+        target_skill_lock_path: target.skill_lock_path.clone(),
         operations,
         sessions,
         reference_rewrites,
@@ -398,6 +506,8 @@ fn validate_plan_inputs(
     }
     if !is_target_absolute(&target.codex_home, target.target_os)?
         || !is_target_absolute(projects_root, target.target_os)?
+        || !is_target_absolute(&target.agents_skills_root, target.target_os)?
+        || !is_target_absolute(&target.skill_lock_path, target.target_os)?
     {
         return Err(restore_failed("restore target paths must be absolute"));
     }
@@ -477,6 +587,192 @@ fn classify_file(
         expected_previous_hash,
         action,
         rollback_required: matches!(action, ChangeKind::Add | ChangeKind::Update),
+        root_kind: crate::core::models::RestoreRootKind::CodexHome,
+        operation_kind: crate::core::models::OperationKind::File,
+        content_id: None,
+        expected_final_hash: Some(payload.content_hash.clone()),
+    })
+}
+
+fn resolve_skill_target(
+    agents_skills_root: &Path,
+    relative_path: &str,
+    target_os: SourceOs,
+) -> Result<PathBuf, RehomeError> {
+    validate_manifest_path(relative_path)?;
+    if relative_path.contains('/') {
+        return Err(package_invalid(
+            "shared Skill relative path must be one portable component",
+        ));
+    }
+    let requested = join_target(agents_skills_root, relative_path, target_os)?;
+    if target_os != current_source_os() {
+        return Ok(requested);
+    }
+    let metadata = match fs::symlink_metadata(agents_skills_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(requested),
+        Err(error) => {
+            return Err(restore_failed(format!(
+                "could not inspect target shared Skills root: {error}"
+            )))
+        }
+    };
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(restore_failed(
+            "target shared Skills root is not a real directory",
+        ));
+    }
+    let wanted = normalize_target_component(relative_path, target_os);
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(agents_skills_root).map_err(|error| {
+        restore_failed(format!("could not enumerate target shared Skills: {error}"))
+    })? {
+        let entry = entry.map_err(|error| {
+            restore_failed(format!("could not enumerate target shared Skill: {error}"))
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if normalize_target_component(&name, target_os) == wanted {
+            matches.push(entry.path());
+        }
+    }
+    if matches.len() > 1 {
+        return Err(restore_failed(format!(
+            "target shared Skills contain a case or Unicode collision for {relative_path}"
+        )));
+    }
+    Ok(matches.pop().unwrap_or(requested))
+}
+
+fn classify_skill_bundle(
+    target: &Path,
+    incoming_tree_hash: &str,
+    resolution: Option<FileConflictResolution>,
+    target_os: SourceOs,
+) -> Result<(ChangeKind, Option<String>), RehomeError> {
+    if target_os != current_source_os() {
+        return Ok((ChangeKind::Add, None));
+    }
+    if let Some(parent) = target.parent() {
+        validate_root_ancestry(parent, target_os)?;
+    }
+    let metadata = match fs::symlink_metadata(target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((ChangeKind::Add, None))
+        }
+        Err(error) => {
+            return Err(restore_failed(format!(
+                "could not inspect target shared Skill {}: {error}",
+                target.display()
+            )))
+        }
+    };
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Ok((ChangeKind::Preserve, None));
+    }
+    let current_hash = match tree_hash(target) {
+        Ok(hash) => hash,
+        Err(_) => {
+            // An existing bundle with links, special entries, or other
+            // non-portable content is never rewritten. It remains usable on
+            // the target and its lock entry is preserved.
+            return Ok((ChangeKind::Preserve, None));
+        }
+    };
+    if current_hash.eq_ignore_ascii_case(incoming_tree_hash) {
+        return Ok((ChangeKind::Unchanged, Some(current_hash)));
+    }
+    let action = match resolution.unwrap_or(FileConflictResolution::KeepExisting) {
+        FileConflictResolution::KeepExisting => ChangeKind::Preserve,
+        FileConflictResolution::UsePackage => ChangeKind::Update,
+    };
+    Ok((action, Some(current_hash)))
+}
+
+fn plan_skill_lock_operation(
+    package_source: &str,
+    target: &Path,
+    package_lock: &SkillLockFileV3,
+    decisions: &BTreeMap<String, ChangeKind>,
+    target_os: SourceOs,
+) -> Result<PlannedOperation, RehomeError> {
+    const MAX_LOCK_BYTES: u64 = 4 * 1024 * 1024;
+    let (target_bytes, previous_hash, target_exists, target_is_regular) =
+        if target_os != current_source_os() {
+            (None, None, false, true)
+        } else {
+            match fs::symlink_metadata(target) {
+                Ok(metadata) if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() => {
+                    (None, None, true, false)
+                }
+                Ok(metadata) => {
+                    if metadata.len() > MAX_LOCK_BYTES {
+                        return Ok(PlannedOperation {
+                            package_source: package_source.to_owned(),
+                            target: target.to_path_buf(),
+                            expected_previous_hash: Some(hash_file(target)?),
+                            action: ChangeKind::Preserve,
+                            rollback_required: false,
+                            root_kind: RestoreRootKind::AgentsMetadata,
+                            operation_kind: OperationKind::SkillLock,
+                            content_id: None,
+                            expected_final_hash: None,
+                        });
+                    }
+                    let bytes = fs::read(target).map_err(|error| {
+                        restore_failed(format!("could not read target Skill lock: {error}"))
+                    })?;
+                    let hash = format!("{:x}", Sha256::digest(&bytes));
+                    (Some(bytes), Some(hash), true, true)
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (None, None, false, true),
+                Err(error) => {
+                    return Err(restore_failed(format!(
+                        "could not inspect target Skill lock: {error}"
+                    )))
+                }
+            }
+        };
+    if !target_is_regular {
+        return Ok(PlannedOperation {
+            package_source: package_source.to_owned(),
+            target: target.to_path_buf(),
+            expected_previous_hash: previous_hash,
+            action: ChangeKind::Preserve,
+            rollback_required: false,
+            root_kind: RestoreRootKind::AgentsMetadata,
+            operation_kind: OperationKind::SkillLock,
+            content_id: None,
+            expected_final_hash: None,
+        });
+    }
+    let merge = merge_skill_lock(package_lock, target_bytes.as_deref(), decisions)
+        .map_err(|error| restore_failed(error.message))?;
+    let (action, expected_final_hash) = match merge {
+        LockMergeResult::Write(bytes) => (
+            if target_exists {
+                ChangeKind::Update
+            } else {
+                ChangeKind::Add
+            },
+            Some(format!("{:x}", Sha256::digest(&bytes))),
+        ),
+        LockMergeResult::Unchanged => (ChangeKind::Unchanged, previous_hash.clone()),
+        LockMergeResult::SkippedInvalidTarget => (ChangeKind::Preserve, previous_hash.clone()),
+    };
+    Ok(PlannedOperation {
+        package_source: package_source.to_owned(),
+        target: target.to_path_buf(),
+        expected_previous_hash: previous_hash,
+        action,
+        rollback_required: matches!(action, ChangeKind::Add | ChangeKind::Update),
+        root_kind: RestoreRootKind::AgentsMetadata,
+        operation_kind: OperationKind::SkillLock,
+        content_id: None,
+        expected_final_hash,
     })
 }
 
@@ -594,6 +890,10 @@ fn classify_plugin_file(
         expected_previous_hash,
         action,
         rollback_required: false,
+        root_kind: crate::core::models::RestoreRootKind::CodexHome,
+        operation_kind: crate::core::models::OperationKind::File,
+        content_id: None,
+        expected_final_hash: None,
     })
 }
 
@@ -649,6 +949,10 @@ fn classify_bridge_change(source: &str, target: PathBuf, state: TargetState) -> 
         expected_previous_hash,
         action,
         rollback_required: matches!(action, ChangeKind::Add | ChangeKind::Update),
+        root_kind: crate::core::models::RestoreRootKind::CodexHome,
+        operation_kind: crate::core::models::OperationKind::File,
+        content_id: None,
+        expected_final_hash: None,
     }
 }
 
@@ -729,6 +1033,24 @@ fn join_target(root: &Path, relative: &str, target_os: SourceOs) -> Result<PathB
     let root = root.trim_end_matches(['/', '\\']);
     let relative = relative.replace(['/', '\\'], &separator.to_string());
     Ok(PathBuf::from(format!("{root}{separator}{relative}")))
+}
+
+fn portable_target_parent(path: &Path, target_os: SourceOs) -> Result<PathBuf, RehomeError> {
+    let value = target_path_text(path)?;
+    let separator = match target_os {
+        SourceOs::Windows => ['\\', '/'].as_slice(),
+        SourceOs::Macos => ['/'].as_slice(),
+    };
+    let trimmed = value.trim_end_matches(separator);
+    let index = trimmed
+        .rfind(separator)
+        .ok_or_else(|| restore_failed("target path has no parent directory"))?;
+    let parent = &trimmed[..index];
+    if parent.is_empty() {
+        Ok(PathBuf::from("/"))
+    } else {
+        Ok(PathBuf::from(parent))
+    }
 }
 
 fn branch_session_target(
@@ -1357,6 +1679,39 @@ fn validate_final_targets(
     Ok(())
 }
 
+fn validate_final_targets_with_agents(
+    operations: &[PlannedOperation],
+    codex_home: &Path,
+    projects_root: &Path,
+    agents_skills_root: &Path,
+    skill_lock_path: &Path,
+    target_os: SourceOs,
+) -> Result<(), RehomeError> {
+    validate_final_targets(operations, codex_home, projects_root, target_os)?;
+    validate_root_separation(codex_home, agents_skills_root, target_os)?;
+    validate_root_separation(projects_root, agents_skills_root, target_os)?;
+    let codex_key = target_path_key(codex_home, target_os)?;
+    let projects_key = target_path_key(projects_root, target_os)?;
+    let agents_key = target_path_key(agents_skills_root, target_os)?;
+    let lock_key = target_path_key(skill_lock_path, target_os)?;
+    for operation in operations {
+        let target_key = target_path_key(&operation.target, target_os)?;
+        let contained = match operation.root_kind {
+            RestoreRootKind::CodexHome => target_key.starts_with(&codex_key),
+            RestoreRootKind::Projects => target_key.starts_with(&projects_key),
+            RestoreRootKind::AgentsSkills => target_key.starts_with(&agents_key),
+            RestoreRootKind::AgentsMetadata => target_key == lock_key,
+        };
+        if !contained {
+            return Err(restore_failed(format!(
+                "restore target is outside its declared root: {}",
+                operation.target.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_root_ancestry(path: &Path, target_os: SourceOs) -> Result<(), RehomeError> {
     if target_os != current_source_os() {
         return Ok(());
@@ -1749,6 +2104,10 @@ mod tests {
                 expected_previous_hash: None,
                 action: ChangeKind::Add,
                 rollback_required: true,
+                root_kind: crate::core::models::RestoreRootKind::CodexHome,
+                operation_kind: crate::core::models::OperationKind::File,
+                content_id: None,
+                expected_final_hash: None,
             },
             PlannedOperation {
                 package_source: "second".into(),
@@ -1756,6 +2115,10 @@ mod tests {
                 expected_previous_hash: None,
                 action: ChangeKind::Add,
                 rollback_required: true,
+                root_kind: crate::core::models::RestoreRootKind::CodexHome,
+                operation_kind: crate::core::models::OperationKind::File,
+                content_id: None,
+                expected_final_hash: None,
             },
         ];
 
@@ -1786,6 +2149,10 @@ mod tests {
                     expected_previous_hash: None,
                     action: ChangeKind::Add,
                     rollback_required: true,
+                    root_kind: crate::core::models::RestoreRootKind::CodexHome,
+                    operation_kind: crate::core::models::OperationKind::File,
+                    content_id: None,
+                    expected_final_hash: None,
                 })
                 .collect::<Vec<_>>();
 
@@ -1800,6 +2167,23 @@ mod tests {
             assert_eq!(error.code, ErrorCode::RestoreFailed);
             assert!(error.message.contains("overlap"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_existing_skill_bundle_is_preserved_without_offering_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = fs::canonicalize(temp.path()).unwrap().join("linked-skill");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("SKILL.md"), b"# Local\n").unwrap();
+        symlink(target.join("SKILL.md"), target.join("nested-link")).unwrap();
+
+        let (action, expected) =
+            classify_skill_bundle(&target, &"a".repeat(64), None, current_source_os()).unwrap();
+        assert_eq!(action, ChangeKind::Preserve);
+        assert!(expected.is_none());
     }
 
     #[test]

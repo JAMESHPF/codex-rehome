@@ -1,16 +1,23 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{synthetic_codex_fixture, SyntheticCodexFixture, THREAD_ID};
+use common::{
+    synthetic_codex_fixture, test_agents_skills_root, test_skill_lock_path, SyntheticCodexFixture,
+    THREAD_ID,
+};
 use rehome_desktop_lib::core::{
     backup::claim_transaction_rollback,
     error::ErrorCode,
     models::{
         ChangeKind, ContentCounts, ConversationEntry, CreatePackageRequest, FileConflictResolution,
-        RecoveryStatus, RegistrationStatus, RestoreOptions, RestorePlan, SourceOs, TargetInventory,
+        OperationKind, RecoveryStatus, RegistrationStatus, RestoreOptions, RestorePlan,
+        SkillLockEntryV3, SkillLockFileV3, SourceOs, TargetInventory, VerificationStatus,
     },
     package::{create_package, inspect_package},
-    planner::{build_restore_plan, build_restore_plan_with_conflict_resolution},
+    planner::{
+        build_restore_plan, build_restore_plan_with_conflict_resolution,
+        build_restore_plan_with_skill_resolutions,
+    },
     restore::{
         apply_restore, apply_restore_by_id, apply_restore_with_registrar, list_transaction_history,
         list_transactions, recover_incomplete_transactions, rollback, transaction_summary,
@@ -94,6 +101,8 @@ fn replacing_a_conflicting_project_file_is_backed_up_and_rollback_safe(
     let preview = inspect_package(&harness.plan.package_path)?;
     let target = TargetInventory {
         codex_home: harness.plan.target_codex_home.clone(),
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -352,6 +361,8 @@ fn sqlite_wal_update_failure_rolls_back_without_leaving_sidecars() -> Result<(),
     let preview = inspect_package(&harness.plan.package_path)?;
     let target = TargetInventory {
         codex_home: harness.plan.target_codex_home.clone(),
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -393,6 +404,8 @@ fn sqlite_wal_verification_failure_refreshes_sidecars_before_rollback() -> Resul
     let preview = inspect_package(&harness.plan.package_path)?;
     let target = TargetInventory {
         codex_home: harness.plan.target_codex_home.clone(),
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -442,6 +455,8 @@ fn index_failure_before_sqlite_write_restores_a_wal_snapshot_without_false_confl
     let preview = inspect_package(&harness.plan.package_path)?;
     let target = TargetInventory {
         codex_home: harness.plan.target_codex_home.clone(),
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -1235,6 +1250,8 @@ fn sqlite_wal_backup_is_a_coherent_self_contained_database() -> Result<(), Box<d
     let preview = inspect_package(&harness.plan.package_path)?;
     let target = TargetInventory {
         codex_home: harness.plan.target_codex_home.clone(),
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -1261,10 +1278,341 @@ fn sqlite_wal_backup_is_a_coherent_self_contained_database() -> Result<(), Box<d
     Ok(())
 }
 
+#[test]
+fn shared_skill_add_restores_verified_bundle_and_rolls_back_to_absence(
+) -> Result<(), Box<dyn Error>> {
+    let harness = SharedRestoreHarness::new()?;
+    let plan = harness.plan(&BTreeMap::new())?;
+    let bundle = shared_bundle_operation(&plan);
+    assert_eq!(bundle.action, ChangeKind::Add);
+    assert_eq!(bundle.operation_kind, OperationKind::SkillBundle);
+
+    let report = apply_restore(plan, harness.options())?;
+    let target = harness.target_skill();
+    assert_eq!(
+        fs::read(target.join("SKILL.md"))?,
+        b"# Incoming shared Skill\n"
+    );
+    assert_eq!(fs::read(target.join("guide.md"))?, b"incoming guide\n");
+    assert!(report.verification.shared_skill_files_valid);
+    assert_eq!(
+        report.verification.skill_lock_merge,
+        VerificationStatus::Passed
+    );
+    assert_eq!(
+        report.verification.codex_skill_discovery,
+        VerificationStatus::NotRun
+    );
+    let lock: SkillLockFileV3 =
+        serde_json::from_slice(&fs::read(&harness.target.skill_lock_path)?)?;
+    assert!(lock.skills.contains_key("pinfei-shared"));
+
+    let rollback_report = rollback(report.transaction_id)?;
+    assert!(rollback_report.success);
+    assert!(!target.exists());
+    assert!(!harness.target.skill_lock_path.exists());
+    Ok(())
+}
+
+#[test]
+fn shared_skill_default_preserves_target_and_explicit_choice_replaces_whole_bundle_with_rollback(
+) -> Result<(), Box<dyn Error>> {
+    let harness = SharedRestoreHarness::new()?;
+    let target = harness.target_skill();
+    fs::create_dir_all(&target)?;
+    fs::write(target.join("SKILL.md"), b"# Local shared Skill\n")?;
+    fs::write(
+        target.join("local-only.txt"),
+        b"must disappear on whole replacement\n",
+    )?;
+    let mut target_entry = synthetic_skill_lock_entry("target");
+    target_entry.skill_path = Some("skills/pinfei-shared".into());
+    let target_lock = SkillLockFileV3 {
+        version: 3,
+        skills: BTreeMap::from([
+            ("pinfei-shared".into(), target_entry.clone()),
+            ("unrelated".into(), target_entry.clone()),
+        ]),
+        dismissed: Some(serde_json::json!({"notice": true})),
+        last_selected_agents: Some(serde_json::json!(["codex"])),
+    };
+    let mut target_lock_bytes = serde_json::to_vec_pretty(&target_lock)?;
+    target_lock_bytes.push(b'\n');
+    fs::write(&harness.target.skill_lock_path, &target_lock_bytes)?;
+
+    let preserve_plan = harness.plan(&BTreeMap::new())?;
+    assert_eq!(
+        shared_bundle_operation(&preserve_plan).action,
+        ChangeKind::Preserve
+    );
+    let preserve_report = apply_restore(preserve_plan, harness.options())?;
+    assert_eq!(
+        fs::read(target.join("SKILL.md"))?,
+        b"# Local shared Skill\n"
+    );
+    assert!(target.join("local-only.txt").exists());
+    assert_eq!(
+        fs::read(&harness.target.skill_lock_path)?,
+        target_lock_bytes
+    );
+    assert_eq!(
+        preserve_report.verification.skill_lock_merge,
+        VerificationStatus::Passed
+    );
+
+    let content_id = harness.preview.manifest.shared_skills[0].content_id;
+    let resolutions = BTreeMap::from([(content_id, FileConflictResolution::UsePackage)]);
+    let replace_plan = harness.plan(&resolutions)?;
+    assert_eq!(
+        shared_bundle_operation(&replace_plan).action,
+        ChangeKind::Update
+    );
+    let replace_report = apply_restore(replace_plan, harness.options())?;
+
+    assert_eq!(
+        fs::read(target.join("SKILL.md"))?,
+        b"# Incoming shared Skill\n"
+    );
+    assert!(target.join("guide.md").exists());
+    assert!(!target.join("local-only.txt").exists());
+    let merged: SkillLockFileV3 =
+        serde_json::from_slice(&fs::read(&harness.target.skill_lock_path)?)?;
+    assert_eq!(merged.dismissed, target_lock.dismissed);
+    assert_eq!(
+        merged.last_selected_agents,
+        target_lock.last_selected_agents
+    );
+    assert_eq!(merged.skills["unrelated"], target_entry);
+    assert_eq!(
+        merged.skills["pinfei-shared"].r#ref.as_deref(),
+        Some("main")
+    );
+    let journal = harness.read_journal(replace_report.transaction_id)?;
+    let directory_backup = journal["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["target"] == target.to_string_lossy().as_ref())
+        .ok_or("shared Skill directory backup is missing")?;
+    assert_eq!(directory_backup["backup_kind"], "directory");
+
+    assert!(rollback(replace_report.transaction_id)?.success);
+    assert_eq!(
+        fs::read(target.join("SKILL.md"))?,
+        b"# Local shared Skill\n"
+    );
+    assert!(target.join("local-only.txt").exists());
+    assert!(!target.join("guide.md").exists());
+    assert_eq!(
+        fs::read(&harness.target.skill_lock_path)?,
+        target_lock_bytes
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_target_lock_is_preserved_while_skill_content_still_restores(
+) -> Result<(), Box<dyn Error>> {
+    let harness = SharedRestoreHarness::new()?;
+    let invalid_lock = b"{synthetic-invalid-lock";
+    fs::write(&harness.target.skill_lock_path, invalid_lock)?;
+    let plan = harness.plan(&BTreeMap::new())?;
+    assert_eq!(shared_bundle_operation(&plan).action, ChangeKind::Add);
+    let lock_operation = plan
+        .operations
+        .iter()
+        .find(|operation| operation.operation_kind == OperationKind::SkillLock)
+        .ok_or("Skill lock operation is missing")?;
+    assert_eq!(lock_operation.action, ChangeKind::Preserve);
+
+    let report = apply_restore(plan, harness.options())?;
+    assert!(harness.target_skill().join("SKILL.md").exists());
+    assert_eq!(fs::read(&harness.target.skill_lock_path)?, invalid_lock);
+    assert_eq!(
+        report.verification.skill_lock_merge,
+        VerificationStatus::Skipped
+    );
+
+    assert!(rollback(report.transaction_id)?.success);
+    assert!(!harness.target_skill().exists());
+    assert_eq!(fs::read(&harness.target.skill_lock_path)?, invalid_lock);
+    Ok(())
+}
+
+#[test]
+fn target_lock_type_change_after_planning_aborts_before_restore() -> Result<(), Box<dyn Error>> {
+    let harness = SharedRestoreHarness::new()?;
+    let plan = harness.plan(&BTreeMap::new())?;
+    fs::create_dir_all(&harness.target.skill_lock_path)?;
+
+    let error = apply_restore(plan, harness.options()).unwrap_err();
+
+    assert!(
+        error
+            .message
+            .contains("restore target is not a regular file"),
+        "{}",
+        error.message
+    );
+    assert!(!harness.target_skill().exists());
+    assert!(harness.target.skill_lock_path.is_dir());
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum DatabaseSchema {
     Compatible,
     RequiredColumnWithoutDefault,
+}
+
+struct SharedRestoreHarness {
+    _env_lock: MutexGuard<'static, ()>,
+    _previous_local_app_data: Option<OsString>,
+    _app_data: TempDir,
+    _fixture: SyntheticCodexFixture,
+    preview: rehome_desktop_lib::core::models::PackagePreview,
+    target: TargetInventory,
+    projects_root: PathBuf,
+    backup_root: PathBuf,
+}
+
+impl SharedRestoreHarness {
+    fn new() -> Result<Self, Box<dyn Error>> {
+        let env_lock = APP_DATA_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let app_data = tempfile::tempdir()?;
+        let previous_local_app_data = env::var_os("LOCALAPPDATA");
+        env::set_var("LOCALAPPDATA", app_data.path());
+
+        let fixture = synthetic_codex_fixture()?;
+        let source_agents = fixture.root.join("source-home").join(".agents");
+        let source_skill = source_agents.join("skills").join("pinfei-shared");
+        fs::create_dir_all(&source_skill)?;
+        fs::write(source_skill.join("SKILL.md"), b"# Incoming shared Skill\n")?;
+        fs::write(source_skill.join("guide.md"), b"incoming guide\n")?;
+        let source_lock = SkillLockFileV3 {
+            version: 3,
+            skills: BTreeMap::from([("pinfei-shared".into(), synthetic_skill_lock_entry("main"))]),
+            dismissed: None,
+            last_selected_agents: None,
+        };
+        fs::write(
+            source_agents.join(".skill-lock.json"),
+            serde_json::to_vec_pretty(&source_lock)?,
+        )?;
+        let package_path = fixture.root.join("shared-skills.rehome");
+        create_package(CreatePackageRequest {
+            codex_home: fixture.codex_home.clone(),
+            project_paths: vec![],
+            conversation_ids: vec![],
+            output_path: package_path.clone(),
+            source_device_id: Uuid::nil(),
+            skill_paths: vec![],
+            shared_skill_paths: vec![source_skill],
+            plugin_paths: vec![],
+            generated_image_paths: vec![],
+        })?;
+        let preview = inspect_package(&package_path)?;
+
+        let target_root = fixture.root.join("shared-target");
+        let codex_home = target_root.join(".codex");
+        let agents_skills_root = target_root.join(".agents").join("skills");
+        let skill_lock_path = target_root.join(".agents").join(".skill-lock.json");
+        let projects_root = fixture.root.join("shared-projects");
+        fs::create_dir_all(&codex_home)?;
+        fs::create_dir_all(&agents_skills_root)?;
+        fs::create_dir_all(&projects_root)?;
+        let target = TargetInventory {
+            codex_home,
+            agents_skills_root,
+            skill_lock_path,
+            target_os: current_source_os(),
+            target_arch: "x86_64".into(),
+            counts: ContentCounts::default(),
+            projects: vec![],
+            conversations: vec![],
+        };
+        let backup_root = app_data.path().join("com.rehome.desktop").join("backups");
+        Ok(Self {
+            _env_lock: env_lock,
+            _previous_local_app_data: previous_local_app_data,
+            _app_data: app_data,
+            _fixture: fixture,
+            preview,
+            target,
+            projects_root,
+            backup_root,
+        })
+    }
+
+    fn plan(
+        &self,
+        resolutions: &BTreeMap<Uuid, FileConflictResolution>,
+    ) -> Result<RestorePlan, rehome_desktop_lib::core::error::RehomeError> {
+        build_restore_plan_with_skill_resolutions(
+            &self.preview,
+            &self.target,
+            &self.projects_root,
+            None,
+            resolutions,
+        )
+    }
+
+    fn options(&self) -> RestoreOptions {
+        RestoreOptions {
+            codex_closed_confirmed: true,
+            backup_root: self.backup_root.clone(),
+            register_projects: false,
+        }
+    }
+
+    fn target_skill(&self) -> PathBuf {
+        self.target.agents_skills_root.join("pinfei-shared")
+    }
+
+    fn read_journal(&self, transaction_id: Uuid) -> Result<Value, Box<dyn Error>> {
+        let path = self
+            ._app_data
+            .path()
+            .join("com.rehome.desktop")
+            .join("transactions")
+            .join(format!("{transaction_id}.json"));
+        Ok(serde_json::from_slice(&fs::read(path)?)?)
+    }
+}
+
+impl Drop for SharedRestoreHarness {
+    fn drop(&mut self) {
+        if let Some(value) = self._previous_local_app_data.take() {
+            env::set_var("LOCALAPPDATA", value);
+        } else {
+            env::remove_var("LOCALAPPDATA");
+        }
+    }
+}
+
+fn shared_bundle_operation(
+    plan: &RestorePlan,
+) -> &rehome_desktop_lib::core::models::PlannedOperation {
+    plan.operations
+        .iter()
+        .find(|operation| operation.operation_kind == OperationKind::SkillBundle)
+        .expect("shared Skill bundle operation is missing")
+}
+
+fn synthetic_skill_lock_entry(reference: &str) -> SkillLockEntryV3 {
+    SkillLockEntryV3 {
+        source: "github".into(),
+        source_type: "github".into(),
+        source_url: "https://github.com/example/synthetic-skills".into(),
+        r#ref: Some(reference.into()),
+        skill_path: Some("skills/pinfei-shared".into()),
+        skill_folder_hash: "a".repeat(64),
+        installed_at: "2026-08-19T00:00:00Z".into(),
+        updated_at: "2026-08-19T00:00:00Z".into(),
+        plugin_name: None,
+    }
 }
 
 struct RestoreHarness {
@@ -1317,6 +1665,7 @@ impl RestoreHarness {
             output_path: package_path.clone(),
             source_device_id: Uuid::nil(),
             skill_paths: vec![],
+            shared_skill_paths: vec![],
             plugin_paths: vec![],
             generated_image_paths: vec![],
         })?;
@@ -1333,6 +1682,8 @@ impl RestoreHarness {
         let preview = inspect_package(&package_path)?;
         let target = TargetInventory {
             codex_home,
+            agents_skills_root: test_agents_skills_root(current_source_os()),
+            skill_lock_path: test_skill_lock_path(current_source_os()),
             target_os: current_source_os(),
             target_arch: "x86_64".into(),
             counts: ContentCounts::default(),
@@ -1569,6 +1920,7 @@ fn plan_existing_plugin_version(
         output_path: package_path.clone(),
         source_device_id: Uuid::nil(),
         skill_paths: vec![],
+        shared_skill_paths: vec![],
         plugin_paths: vec![harness._fixture.plugin_manifest_path.clone()],
         generated_image_paths: vec![],
     })?;
@@ -1586,6 +1938,8 @@ fn plan_existing_plugin_version(
     let preview = inspect_package(&package_path)?;
     let target = TargetInventory {
         codex_home: harness.plan.target_codex_home.clone(),
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -1682,6 +2036,8 @@ fn ready_restore_plan(harness: &RestoreHarness) -> Result<RestorePlan, Box<dyn E
     let source = &preview.manifest.conversations[0];
     let target = TargetInventory {
         codex_home: harness.plan.target_codex_home.clone(),
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),

@@ -97,7 +97,7 @@ export default function HistoryPage({
                 <span className={`transaction-icon status-${transaction.status}`}>{committed ? <CheckCircle2 aria-hidden="true" /> : <RotateCcw aria-hidden="true" />}</span>
                 <div><div className="transaction-title"><strong>{statusLabel(transaction.status, t)}</strong><time>{formatDate(transaction.created_at, locale)}</time></div><code>{transaction.transaction_id}</code></div>
               </div>
-              <div className="transaction-facts"><span>{t("变更文件")}<strong>{transaction.changed_files}</strong></span><span>{t("项目目录")}<strong>{transaction.projects_root}</strong></span><span>{t("备份目录")}<strong>{transaction.backup_root}</strong></span></div>
+              <div className="transaction-facts"><span>{t("变更文件")}<strong>{transaction.changed_files}</strong></span><span>{t("项目目录")}<strong>{transaction.projects_root}</strong></span>{transaction.target_agents_skills_root && <span>{t("共享 Skills 目录")}<strong>{transaction.target_agents_skills_root}</strong></span>}<span>{t("备份目录")}<strong>{transaction.backup_root}</strong></span></div>
               <div className="transaction-actions">
                 <button className="icon-text-button" type="button" onClick={() => void handleReveal(transaction.transaction_backup_path, transaction.transaction_id)}><FolderOpen aria-hidden="true" />{t("显示备份")}</button>
                 {transaction.restored_project_paths.map((path) => (

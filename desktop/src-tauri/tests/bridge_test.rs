@@ -1,7 +1,7 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{synthetic_codex_fixture, THREAD_ID};
+use common::{synthetic_codex_fixture, test_agents_skills_root, test_skill_lock_path, THREAD_ID};
 use rehome_desktop_lib::core::{
     bridge::{
         apply_bridge_plan, import_sqlite_threads, merge_session_index, register_project,
@@ -806,6 +806,7 @@ fn bridge_applies_task_six_session_index_and_sqlite_plan() -> Result<(), Box<dyn
         output_path: package_path.clone(),
         source_device_id: Uuid::nil(),
         skill_paths: vec![],
+        shared_skill_paths: vec![],
         plugin_paths: vec![],
         generated_image_paths: vec![],
     })?;
@@ -835,6 +836,8 @@ fn bridge_applies_task_six_session_index_and_sqlite_plan() -> Result<(), Box<dyn
     drop(connection);
     let target = TargetInventory {
         codex_home: codex_home.clone(),
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -896,6 +899,7 @@ fn bridge_revalidates_planned_hash_before_replacing_an_index() -> Result<(), Box
         output_path: package_path.clone(),
         source_device_id: Uuid::nil(),
         skill_paths: vec![],
+        shared_skill_paths: vec![],
         plugin_paths: vec![],
         generated_image_paths: vec![],
     })?;
@@ -913,6 +917,8 @@ fn bridge_revalidates_planned_hash_before_replacing_an_index() -> Result<(), Box
     drop(connection);
     let target = TargetInventory {
         codex_home: codex_home.clone(),
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -944,6 +950,7 @@ fn bridge_revalidates_a_skipped_session_before_accepting_the_plan() -> Result<()
         output_path: package_path.clone(),
         source_device_id: Uuid::nil(),
         skill_paths: vec![],
+        shared_skill_paths: vec![],
         plugin_paths: vec![],
         generated_image_paths: vec![],
     })?;
@@ -959,6 +966,8 @@ fn bridge_revalidates_a_skipped_session_before_accepting_the_plan() -> Result<()
     drop(connection);
     let mut target = TargetInventory {
         codex_home,
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -997,6 +1006,7 @@ fn bridge_rejects_changed_archive_with_same_package_id() -> Result<(), Box<dyn E
         output_path: package_path.clone(),
         source_device_id: Uuid::nil(),
         skill_paths: vec![],
+        shared_skill_paths: vec![],
         plugin_paths: vec![],
         generated_image_paths: vec![],
     })?;
@@ -1012,6 +1022,8 @@ fn bridge_rejects_changed_archive_with_same_package_id() -> Result<(), Box<dyn E
     drop(connection);
     let target = TargetInventory {
         codex_home,
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -1047,6 +1059,7 @@ fn concurrent_bridge_applies_use_compare_and_swap_so_only_one_plan_commits(
         output_path: package_path.clone(),
         source_device_id: Uuid::nil(),
         skill_paths: vec![],
+        shared_skill_paths: vec![],
         plugin_paths: vec![],
         generated_image_paths: vec![],
     })?;
@@ -1062,6 +1075,8 @@ fn concurrent_bridge_applies_use_compare_and_swap_so_only_one_plan_commits(
     drop(connection);
     let target = TargetInventory {
         codex_home,
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -1106,6 +1121,7 @@ fn bridge_refuses_to_replace_a_target_with_an_active_cas_lock() -> Result<(), Bo
         output_path: package_path.clone(),
         source_device_id: Uuid::nil(),
         skill_paths: vec![],
+        shared_skill_paths: vec![],
         plugin_paths: vec![],
         generated_image_paths: vec![],
     })?;
@@ -1121,6 +1137,8 @@ fn bridge_refuses_to_replace_a_target_with_an_active_cas_lock() -> Result<(), Bo
     drop(connection);
     let target = TargetInventory {
         codex_home,
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -1162,6 +1180,7 @@ fn bridge_revalidates_ancestry_after_a_planned_directory_is_swapped_for_a_link(
         output_path: package_path.clone(),
         source_device_id: Uuid::nil(),
         skill_paths: vec![],
+        shared_skill_paths: vec![],
         plugin_paths: vec![],
         generated_image_paths: vec![],
     })?;
@@ -1177,6 +1196,8 @@ fn bridge_revalidates_ancestry_after_a_planned_directory_is_swapped_for_a_link(
     drop(connection);
     let target = TargetInventory {
         codex_home,
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),

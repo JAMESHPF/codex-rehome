@@ -1,5 +1,6 @@
 import { useMemo, useState, type ReactNode, type RefObject } from "react";
 import {
+  AlertTriangle,
   CheckCircle2,
   Bot,
   ChevronDown,
@@ -42,6 +43,7 @@ export default function SendPage({
   const [conversations, setConversations] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [skills, setSkills] = useState<Set<string>>(new Set());
+  const [sharedSkills, setSharedSkills] = useState<Set<string>>(new Set());
   const [plugins, setPlugins] = useState<Set<string>>(new Set());
   const [images, setImages] = useState<Set<string>>(new Set());
   const [report, setReport] = useState<CreatePackageReport | null>(null);
@@ -62,13 +64,18 @@ export default function SendPage({
     [inventory],
   );
 
+  const selectableSharedSkills = useMemo(
+    () => inventory?.shared_skills.filter((skill) => !skill.blocked_reason) ?? [],
+    [inventory],
+  );
   const hasContent =
-    projects.size + conversations.size + skills.size + plugins.size + images.size > 0;
+    projects.size + conversations.size + skills.size + sharedSkills.size + plugins.size + images.size > 0;
   const hasSelectableContent = Boolean(
     inventory &&
       inventory.projects.filter((project) => project.source_available).length +
         inventory.conversations.length +
         inventory.skills.length +
+        selectableSharedSkills.length +
         inventory.plugins.length +
         inventory.generated_images.length >
         0,
@@ -81,6 +88,7 @@ export default function SendPage({
         .every((project) => projects.has(project.project_id)) &&
       inventory.conversations.every((conversation) => conversations.has(conversation.task_id)) &&
       inventory.skills.every((skill) => skills.has(skill.content_id)) &&
+      selectableSharedSkills.every((skill) => sharedSkills.has(skill.content_id)) &&
       inventory.plugins.every((plugin) => plugins.has(plugin.content_id)) &&
       inventory.generated_images.every((image) => images.has(image.content_id)),
   );
@@ -124,6 +132,7 @@ export default function SendPage({
       setProjects(new Set());
       setConversations(new Set());
       setSkills(new Set());
+      setSharedSkills(new Set());
       setPlugins(new Set());
       setImages(new Set());
       return;
@@ -138,6 +147,7 @@ export default function SendPage({
     );
     setConversations(new Set(inventory.conversations.map((conversation) => conversation.task_id)));
     setSkills(new Set(inventory.skills.map((skill) => skill.content_id)));
+    setSharedSkills(new Set(selectableSharedSkills.map((skill) => skill.content_id)));
     setPlugins(new Set(inventory.plugins.map((plugin) => plugin.content_id)));
     setImages(new Set(inventory.generated_images.map((image) => image.content_id)));
   }
@@ -152,6 +162,7 @@ export default function SendPage({
         project_ids: [...projects],
         conversation_ids: [...conversations],
         skill_ids: [...skills],
+        shared_skill_ids: [...sharedSkills],
         plugin_ids: [...plugins],
         generated_image_ids: [...images],
       });
@@ -247,15 +258,28 @@ export default function SendPage({
         </div>
         <div className="optional-content-list">
           <OptionalContentGroup
+            id="shared-skills"
+            title={t("共享用户 Skills")}
+            description={t("来自 ~/.agents/skills；按完整目录迁移")}
+            icon={<Sparkles aria-hidden="true" />}
+            items={inventory?.shared_skills ?? []}
+            selected={sharedSkills}
+            expanded={expanded.has("shared-skills")}
+            onToggleExpanded={() => toggle(setExpanded, expanded, "shared-skills")}
+            onChange={setSharedSkills}
+            showSkillDetails
+          />
+          <OptionalContentGroup
             id="skills"
-            title="Skills"
-            description={t("迁移你希望在新电脑继续使用的能力")}
+            title={t("旧版 Codex Skills")}
+            description={t("来自 Codex Home；保留兼容迁移")}
             icon={<Sparkles aria-hidden="true" />}
             items={inventory?.skills ?? []}
             selected={skills}
             expanded={expanded.has("skills")}
             onToggleExpanded={() => toggle(setExpanded, expanded, "skills")}
             onChange={setSkills}
+            showSkillDetails
           />
           <OptionalContentGroup
             id="plugins"
@@ -390,41 +414,60 @@ interface OptionalContentGroupProps {
   expanded: boolean;
   onToggleExpanded: () => void;
   onChange: (value: Set<string>) => void;
+  showSkillDetails?: boolean;
 }
 
-function OptionalContentGroup({ id, title, description, icon, items, selected, expanded, onToggleExpanded, onChange }: OptionalContentGroupProps) {
+function OptionalContentGroup({ id, title, description, icon, items, selected, expanded, onToggleExpanded, onChange, showSkillDetails = false }: OptionalContentGroupProps) {
   const { t } = useI18n();
-  const allSelected = items.length > 0 && items.every((item) => selected.has(item.content_id));
-  function toggleItem(contentId: string) {
+  const selectableItems = items.filter((item) => !item.blocked_reason);
+  const selectedCount = selectableItems.filter((item) => selected.has(item.content_id)).length;
+  const allSelected = selectableItems.length > 0 && selectedCount === selectableItems.length;
+  function toggleItem(item: OptionalContentEntry) {
+    if (item.blocked_reason) return;
     const next = new Set(selected);
-    if (next.has(contentId)) next.delete(contentId);
-    else next.add(contentId);
+    if (next.has(item.content_id)) next.delete(item.content_id);
+    else next.add(item.content_id);
     onChange(next);
   }
   function toggleAll() {
-    onChange(allSelected ? new Set() : new Set(items.map((item) => item.content_id)));
+    onChange(allSelected ? new Set() : new Set(selectableItems.map((item) => item.content_id)));
   }
 
   return (
     <div className="optional-content-group">
       <div className="optional-content-header">
         <label className="optional-all-toggle">
-          <input type="checkbox" checked={allSelected} onChange={toggleAll} disabled={!items.length} aria-label={t("全选 {name}", { name: title })} />
+          <input type="checkbox" checked={allSelected} onChange={toggleAll} disabled={!selectableItems.length} aria-label={t("全选 {name}", { name: title })} />
           {icon}
           <span><strong>{title}</strong><small>{description}</small></span>
         </label>
         <button type="button" className="project-expand" aria-expanded={expanded} aria-controls={`optional-${id}`} onClick={onToggleExpanded}>
-          <span>{t("已选 {selected} / {total}", { selected: selected.size, total: items.length })}</span>
+          <span>{t("已选 {selected} / {total}", { selected: selectedCount, total: selectableItems.length })}</span>
           {expanded ? <ChevronDown aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}
         </button>
       </div>
       {expanded && (
         <div className="optional-items" id={`optional-${id}`}>
           {items.map((item) => (
-            <div className={`optional-item${item.thumbnail_data_url ? " optional-item-image" : ""}`} key={item.content_id}>
-              <input type="checkbox" checked={selected.has(item.content_id)} onChange={() => toggleItem(item.content_id)} aria-label={t("选择 {name}", { name: item.name })} />
+            <div className={`optional-item${item.thumbnail_data_url ? " optional-item-image" : ""}${item.blocked_reason ? " optional-item-blocked" : ""}`} key={item.content_id}>
+              <input type="checkbox" checked={selected.has(item.content_id)} onChange={() => toggleItem(item)} disabled={Boolean(item.blocked_reason)} aria-label={t("选择 {name}", { name: item.name })} />
               {item.thumbnail_data_url && <img className="image-thumbnail" src={item.thumbnail_data_url} alt="" />}
-              <span><strong>{item.name}</strong><small>{item.relative_path}</small></span>
+              <span>
+                <strong>{item.name}</strong>
+                <small>{item.relative_path}</small>
+                {showSkillDetails && (
+                  <span className="skill-detail-line">
+                    <small>{skillOriginLabel(item, t)}</small>
+                    <small>{skillLockLabel(item, t)}</small>
+                    {(item.exclusions?.excluded_files ?? 0) > 0 && (
+                      <small>{t("已排除 {count} 个文件", { count: item.exclusions!.excluded_files })}</small>
+                    )}
+                  </span>
+                )}
+                {item.blocked_reason && (
+                  <small className="skill-blocked-reason"><AlertTriangle aria-hidden="true" />{t("已阻止：{reason}", { reason: item.blocked_reason })}</small>
+                )}
+              </span>
               <small className="item-size">{formatBytes(item.size_bytes)}</small>
               {item.reveal_id && (
                 <button className="icon-button image-reveal-button" type="button" title={t("在文件夹中显示")} aria-label={t("在文件夹中显示 {name}", { name: item.name })} onClick={() => void openPath(item.reveal_id!)}>
@@ -438,6 +481,29 @@ function OptionalContentGroup({ id, title, description, icon, items, selected, e
       )}
     </div>
   );
+}
+
+function skillOriginLabel(
+  item: OptionalContentEntry,
+  t: (key: string, variables?: Record<string, string | number>) => string,
+): string {
+  return t(item.skill_root_kind === "shared_agents" ? "来源：共享用户目录" : "来源：旧版 Codex 目录");
+}
+
+function skillLockLabel(
+  item: OptionalContentEntry,
+  t: (key: string, variables?: Record<string, string | number>) => string,
+): string {
+  if (item.skill_root_kind === "legacy_codex") return t("lock：不适用");
+  const labels = {
+    available: "lock：可迁移",
+    missing: "lock：不存在",
+    content_only: "lock：仅迁移内容",
+    invalid: "lock：JSON 无效",
+    unsupported: "lock：版本不支持",
+    not_applicable: "lock：不适用",
+  } as const;
+  return t(item.lock_status ? labels[item.lock_status] : "lock：状态未知");
 }
 
 function formatDisplayPath(value: string): string {

@@ -9,6 +9,21 @@ export type RecoveryStatus =
   | "rollback_failed";
 export type ChangeKind = "add" | "update" | "unchanged" | "preserve" | "conflict";
 export type FileConflictResolution = "keep_existing" | "use_package";
+export type SkillRootKind = "shared_agents" | "legacy_codex";
+export type SkillLockStatus =
+  | "available"
+  | "missing"
+  | "content_only"
+  | "invalid"
+  | "unsupported"
+  | "not_applicable";
+export type RestoreRootKind =
+  | "codex_home"
+  | "projects"
+  | "agents_skills"
+  | "agents_metadata";
+export type OperationKind = "file" | "skill_bundle" | "skill_lock";
+export type VerificationStatus = "passed" | "failed" | "skipped" | "not_run";
 export type RegistrationStatus =
   | "registered"
   | "command_unavailable"
@@ -66,10 +81,43 @@ export interface OptionalContentEntry {
   size_bytes: number;
   thumbnail_data_url: string | null;
   reveal_id: string | null;
+  skill_root_kind?: SkillRootKind | null;
+  lock_status?: SkillLockStatus | null;
+  exclusions?: ExclusionSummary;
+  blocked_reason?: string | null;
+  tree_hash?: string | null;
+}
+
+export interface ExclusionSummary {
+  excluded_files: number;
+  excluded_bytes: number;
+  rules: string[];
+}
+
+export interface SharedSkillEntry {
+  content_id: string;
+  name: string;
+  root_kind: SkillRootKind;
+  relative_path: string;
+  archive_root: string;
+  file_count: number;
+  content_bytes: number;
+  tree_hash: string;
+  exclusions: ExclusionSummary;
+  lock_key: string | null;
+}
+
+export interface SharedSkillLockMetadata {
+  archive_path: string;
+  entry_count: number;
+  content_only_count: number;
 }
 
 export interface CodexInventory {
   codex_home: string;
+  agents_skills_root: string | null;
+  agents_skills_canonical_root: string | null;
+  skill_lock_path: string | null;
   source_os: SourceOs;
   source_arch: string;
   source_device_id: string;
@@ -81,9 +129,11 @@ export interface CodexInventory {
   session_index_path: string | null;
   state_db_path: string | null;
   skill_paths: string[];
+  shared_skill_paths: string[];
   plugin_paths: string[];
   generated_image_paths: string[];
   skills: OptionalContentEntry[];
+  shared_skills: OptionalContentEntry[];
   plugins: OptionalContentEntry[];
   generated_images: OptionalContentEntry[];
   warnings: string[];
@@ -93,6 +143,7 @@ export interface CreatePackageRequest {
   project_ids: string[];
   conversation_ids: string[];
   skill_ids: string[];
+  shared_skill_ids: string[];
   plugin_ids: string[];
   generated_image_ids: string[];
 }
@@ -119,11 +170,9 @@ export interface PackageManifest {
   counts: ContentCounts;
   projects: ProjectEntry[];
   conversations: ConversationEntry[];
-  exclusions: {
-    excluded_files: number;
-    excluded_bytes: number;
-    rules: string[];
-  };
+  exclusions: ExclusionSummary;
+  shared_skills?: SharedSkillEntry[];
+  shared_skill_lock?: SharedSkillLockMetadata | null;
 }
 
 export interface PackagePreview {
@@ -142,6 +191,10 @@ export interface PlannedOperation {
   expected_previous_hash: string | null;
   action: ChangeKind;
   rollback_required: boolean;
+  root_kind?: RestoreRootKind;
+  operation_kind?: OperationKind;
+  content_id?: string | null;
+  expected_final_hash?: string | null;
 }
 
 export interface RestorePlan {
@@ -151,6 +204,8 @@ export interface RestorePlan {
   archive_hash: string;
   target_codex_home: string;
   projects_root: string;
+  target_agents_skills_root: string;
+  target_skill_lock_path: string;
   operations: PlannedOperation[];
   sessions: unknown[];
   reference_rewrites: unknown[];
@@ -185,6 +240,10 @@ export interface VerificationReport {
   project_files_valid: boolean;
   app_registration_valid: boolean;
   app_visible_ready: boolean;
+  shared_skill_files_valid: boolean;
+  codex_skill_discovery: VerificationStatus;
+  skill_lock_merge: VerificationStatus;
+  functional_sampling: VerificationStatus;
 }
 
 export interface ProjectRegistration {
@@ -219,6 +278,7 @@ export interface TransactionSummary {
   transaction_backup_path: string;
   target_codex_home: string;
   projects_root: string;
+  target_agents_skills_root: string;
   restored_project_paths: string[];
   changed_files: number;
 }

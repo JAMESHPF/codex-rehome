@@ -1,7 +1,9 @@
 use crate::core::{
     backup::{
-        ensure_applied_states, prepare_transaction, record_applied_mutation, rollback_prepared,
-        update_status, PreparedTransaction,
+        begin_bundle_stage, begin_bundle_swap, cleanup_bundle_quarantines, ensure_applied_states,
+        prepare_transaction, record_applied_mutation, record_bundle_phase,
+        record_file_write_intent, rollback_prepared, update_status, BundlePhase,
+        PreparedTransaction,
     },
     bridge::{
         apply_bridge_plan_for_transaction, apply_file_source_for_transaction,
@@ -9,22 +11,40 @@ use crate::core::{
     },
     error::{ErrorCode, RehomeError},
     models::{
-        ChangeKind, PendingRecovery, ProjectRegistration, RecoveryStatus, ReferenceRewriteKind,
-        RegistrationStatus, RestoreOptions, RestorePlan, RestoreReport, RollbackReport, SourceOs,
-        TransactionHistory, TransactionSummary, VerificationReport,
+        ChangeKind, OperationKind, PendingRecovery, ProjectRegistration, RecoveryStatus,
+        ReferenceRewriteKind, RegistrationStatus, RestoreOptions, RestorePlan, RestoreReport,
+        RollbackReport, SkillLockFileV3, SourceOs, TransactionHistory, TransactionSummary,
+        VerificationReport, VerificationStatus,
     },
     package::{inspect_package_for_planning, VerifiedPackage},
+    paths::normalize_entry,
+    shared_skills::{merge_skill_lock, tree_hash, LockMergeResult},
+    stable_fs::PinnedParent,
 };
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs, io, path::Path};
+use std::{
+    collections::BTreeMap,
+    ffi::OsStr,
+    fs,
+    io::{self, Read, Write},
+    path::Path,
+};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 const SESSION_INDEX_SOURCE: &str = "codex/session_index.jsonl";
 const THREAD_METADATA_SOURCE: &str = "codex/metadata/threads.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestoreFaultPoint {
+    SkillTargetQuarantined,
+    SkillBundleReplaced,
+    BeforeSkillLockWrite,
+    AfterSkillLockWrite,
+}
 
 pub fn apply_restore(
     plan: RestorePlan,
@@ -58,7 +78,16 @@ pub fn apply_restore_with_registrar(
 fn apply_server_plan(
     plan: RestorePlan,
     options: RestoreOptions,
+    registrar: impl FnMut(SourceOs, &Path) -> RegistrationStatus,
+) -> Result<RestoreReport, RehomeError> {
+    apply_server_plan_with_fault(plan, options, registrar, |_| Ok(()))
+}
+
+fn apply_server_plan_with_fault(
+    plan: RestorePlan,
+    options: RestoreOptions,
     mut registrar: impl FnMut(SourceOs, &Path) -> RegistrationStatus,
+    mut fault: impl FnMut(RestoreFaultPoint) -> Result<(), RehomeError>,
 ) -> Result<RestoreReport, RehomeError> {
     if !options.codex_closed_confirmed {
         return Err(RehomeError::new(
@@ -78,7 +107,14 @@ fn apply_server_plan(
     validate_preserved_targets(&plan)?;
     let mut transaction = prepare_transaction(&plan, &options.backup_root)?;
 
-    let result = apply_transaction(&plan, &options, &verified, &mut transaction, &mut registrar);
+    let result = apply_transaction(
+        &plan,
+        &options,
+        &verified,
+        &mut transaction,
+        &mut registrar,
+        &mut fault,
+    );
     match result {
         Ok(report) => Ok(report),
         Err(error) => match rollback_prepared(&mut transaction) {
@@ -122,11 +158,12 @@ fn apply_transaction(
     verified: &VerifiedPackage,
     transaction: &mut PreparedTransaction,
     registrar: &mut impl FnMut(SourceOs, &Path) -> RegistrationStatus,
+    fault: &mut impl FnMut(RestoreFaultPoint) -> Result<(), RehomeError>,
 ) -> Result<RestoreReport, RehomeError> {
     update_status(transaction, RecoveryStatus::Applying)?;
     let transaction_id = transaction.journal.transaction_id;
     let (mut restored_files, mut restored_bytes) =
-        apply_regular_files(plan, verified, transaction)?;
+        apply_regular_files(plan, verified, transaction, fault)?;
     let bridge = apply_bridge_plan_for_transaction(plan, transaction_id, |target| {
         record_applied_mutation(transaction, target)
     })
@@ -168,6 +205,7 @@ fn apply_transaction(
         )));
     }
     ensure_applied_states(transaction)?;
+    cleanup_bundle_quarantines(transaction)?;
     update_status(transaction, RecoveryStatus::Committed)?;
     let registrations = register_projects(plan, options, verified, registrar);
     verification.app_registration_valid = options.register_projects
@@ -192,6 +230,8 @@ fn validate_plan(plan: &RestorePlan) -> Result<(), RehomeError> {
     if !plan.package_path.is_absolute()
         || !plan.target_codex_home.is_absolute()
         || !plan.projects_root.is_absolute()
+        || !plan.target_agents_skills_root.is_absolute()
+        || !plan.target_skill_lock_path.is_absolute()
     {
         return Err(restore_failed("restore plan paths must be absolute"));
     }
@@ -208,6 +248,18 @@ fn validate_plan(plan: &RestorePlan) -> Result<(), RehomeError> {
     }
     if plan.target_codex_home.starts_with(&plan.projects_root)
         || plan.projects_root.starts_with(&plan.target_codex_home)
+        || plan
+            .target_codex_home
+            .starts_with(&plan.target_agents_skills_root)
+        || plan
+            .target_agents_skills_root
+            .starts_with(&plan.target_codex_home)
+        || plan
+            .projects_root
+            .starts_with(&plan.target_agents_skills_root)
+        || plan
+            .target_agents_skills_root
+            .starts_with(&plan.projects_root)
     {
         return Err(restore_failed("restore roots must not overlap"));
     }
@@ -235,14 +287,32 @@ fn validate_package_identity(
         ));
     }
     for operation in &plan.operations {
-        if !verified.payloads.contains_key(&operation.package_source) {
-            return Err(RehomeError::new(
-                ErrorCode::PackageInvalid,
-                format!(
-                    "restore operation references a missing package payload: {}",
-                    operation.package_source
-                ),
-            ));
+        match operation.operation_kind {
+            OperationKind::File | OperationKind::SkillLock => {
+                if !verified.payloads.contains_key(&operation.package_source) {
+                    return Err(RehomeError::new(
+                        ErrorCode::PackageInvalid,
+                        format!(
+                            "restore operation references a missing package payload: {}",
+                            operation.package_source
+                        ),
+                    ));
+                }
+            }
+            OperationKind::SkillBundle => {
+                let prefix = format!("{}/", operation.package_source);
+                if operation.content_id.is_none()
+                    || !verified
+                        .payloads
+                        .keys()
+                        .any(|source| source.starts_with(&prefix))
+                {
+                    return Err(RehomeError::new(
+                        ErrorCode::PackageInvalid,
+                        "Skill bundle operation references missing package payloads",
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -252,37 +322,390 @@ fn apply_regular_files(
     plan: &RestorePlan,
     verified: &VerifiedPackage,
     transaction: &mut PreparedTransaction,
+    fault: &mut impl FnMut(RestoreFaultPoint) -> Result<(), RehomeError>,
 ) -> Result<(u64, u64), RehomeError> {
     let mut restored_files = 0_u64;
     let mut restored_bytes = 0_u64;
-    for operation in &plan.operations {
-        if !matches!(operation.action, ChangeKind::Add | ChangeKind::Update)
-            || is_bridge_operation(plan, &operation.package_source)
-        {
-            continue;
+    for kind in [
+        OperationKind::File,
+        OperationKind::SkillBundle,
+        OperationKind::SkillLock,
+    ] {
+        for operation in &plan.operations {
+            if operation.operation_kind != kind
+                || !matches!(operation.action, ChangeKind::Add | ChangeKind::Update)
+                || is_bridge_operation(plan, &operation.package_source)
+            {
+                continue;
+            }
+            let (files, bytes) = match operation.operation_kind {
+                OperationKind::File => {
+                    let mut staged = NamedTempFile::new().map_err(|error| {
+                        restore_failed(format!("could not stage restored payload: {error}"))
+                    })?;
+                    let bytes = verified.write_authenticated_payload(
+                        &operation.package_source,
+                        staged.as_file_mut(),
+                    )?;
+                    staged.as_file().sync_all().map_err(|error| {
+                        restore_failed(format!("could not flush restored payload: {error}"))
+                    })?;
+                    let root = operation_root(plan, &operation.target)?;
+                    apply_file_source_for_transaction(
+                        root,
+                        operation,
+                        staged.path(),
+                        transaction.journal.transaction_id,
+                    )?;
+                    record_applied_mutation(transaction, &operation.target)?;
+                    (1, bytes)
+                }
+                OperationKind::SkillBundle => {
+                    apply_skill_bundle(plan, verified, operation, transaction, fault)?
+                }
+                OperationKind::SkillLock => {
+                    let bytes = apply_skill_lock(plan, verified, operation, transaction, fault)?;
+                    (1, bytes)
+                }
+            };
+            restored_files = restored_files
+                .checked_add(files)
+                .ok_or_else(|| restore_failed("restored file count overflowed"))?;
+            restored_bytes = restored_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| restore_failed("restored byte count overflowed"))?;
         }
-        let mut staged = NamedTempFile::new().map_err(|error| {
-            restore_failed(format!("could not stage restored payload: {error}"))
-        })?;
-        let bytes = verified
-            .write_authenticated_payload(&operation.package_source, staged.as_file_mut())?;
-        staged.as_file().sync_all().map_err(|error| {
-            restore_failed(format!("could not flush restored payload: {error}"))
-        })?;
-        let root = operation_root(plan, &operation.target)?;
-        apply_file_source_for_transaction(
-            root,
-            operation,
-            staged.path(),
-            transaction.journal.transaction_id,
-        )?;
-        record_applied_mutation(transaction, &operation.target)?;
-        restored_files += 1;
-        restored_bytes = restored_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| restore_failed("restored byte count overflowed"))?;
     }
     Ok((restored_files, restored_bytes))
+}
+
+fn apply_skill_bundle(
+    plan: &RestorePlan,
+    verified: &VerifiedPackage,
+    operation: &crate::core::models::PlannedOperation,
+    transaction: &mut PreparedTransaction,
+    fault: &mut impl FnMut(RestoreFaultPoint) -> Result<(), RehomeError>,
+) -> Result<(u64, u64), RehomeError> {
+    let content_id = operation
+        .content_id
+        .ok_or_else(|| restore_failed("Skill bundle operation has no content ID"))?;
+    let manifest = verified
+        .preview
+        .manifest
+        .shared_skills
+        .iter()
+        .find(|skill| skill.content_id == content_id)
+        .ok_or_else(|| restore_failed("Skill bundle manifest entry is missing"))?;
+    if manifest.archive_root != operation.package_source {
+        return Err(restore_failed(
+            "Skill bundle operation does not match its manifest entry",
+        ));
+    }
+    let parent = operation
+        .target
+        .parent()
+        .ok_or_else(|| restore_failed("Skill bundle target has no parent"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| restore_failed(format!("could not create shared Skills root: {error}")))?;
+    crate::core::bridge::validate_restore_target_ancestry(
+        &plan.target_agents_skills_root,
+        &operation.target,
+    )?;
+    let pinned = PinnedParent::open(parent)
+        .map_err(|error| restore_failed(format!("could not pin shared Skills root: {error}")))?;
+    let _lock = BundleTargetLock::acquire(
+        parent,
+        operation
+            .target
+            .file_name()
+            .ok_or_else(|| restore_failed("Skill bundle target has no name"))?,
+        transaction.journal.transaction_id,
+    )?;
+    let stage_path = begin_bundle_stage(transaction, &operation.target)?;
+    let stage_component = stage_path
+        .file_name()
+        .ok_or_else(|| restore_failed("Skill staging path has no name"))?;
+    if pinned
+        .child_exists(stage_component)
+        .map_err(|error| restore_failed(format!("could not inspect Skill staging: {error}")))?
+    {
+        return Err(restore_failed(
+            "owned Skill staging directory already exists",
+        ));
+    }
+    pinned
+        .create_directory(stage_component)
+        .map_err(|error| restore_failed(format!("could not create Skill staging: {error}")))?;
+
+    let result = (|| {
+        let prefix = format!("{}/", manifest.archive_root);
+        let mut file_count = 0_u64;
+        let mut byte_count = 0_u64;
+        for (source, payload) in verified
+            .payloads
+            .iter()
+            .filter(|(source, _)| source.starts_with(&prefix))
+        {
+            let relative = source
+                .strip_prefix(&prefix)
+                .ok_or_else(|| restore_failed("Skill payload path is malformed"))?;
+            let normalized = normalize_entry(Path::new(relative))
+                .map_err(|error| restore_failed(error.message))?;
+            if normalized != relative {
+                return Err(restore_failed("Skill payload path is not normalized"));
+            }
+            let destination = stage_path.join(Path::new(relative));
+            let destination_parent = destination
+                .parent()
+                .ok_or_else(|| restore_failed("Skill payload target has no parent"))?;
+            fs::create_dir_all(destination_parent).map_err(|error| {
+                restore_failed(format!("could not create Skill payload directory: {error}"))
+            })?;
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .map_err(|error| {
+                    restore_failed(format!("could not create staged Skill file: {error}"))
+                })?;
+            let written = verified.write_authenticated_payload(source, &mut output)?;
+            output.sync_all().map_err(|error| {
+                restore_failed(format!("could not flush staged Skill file: {error}"))
+            })?;
+            if written != payload.size_bytes {
+                return Err(restore_failed("staged Skill payload size changed"));
+            }
+            file_count += 1;
+            byte_count = byte_count
+                .checked_add(written)
+                .ok_or_else(|| restore_failed("staged Skill byte count overflowed"))?;
+        }
+        if file_count != manifest.file_count || byte_count != manifest.content_bytes {
+            return Err(restore_failed(
+                "staged Skill counts do not match the package manifest",
+            ));
+        }
+        let staged_hash = tree_hash(&stage_path).map_err(|error| restore_failed(error.message))?;
+        if !staged_hash.eq_ignore_ascii_case(&manifest.tree_hash) {
+            return Err(restore_failed(
+                "staged Skill tree hash does not match the package manifest",
+            ));
+        }
+
+        let quarantine = begin_bundle_swap(transaction, &operation.target)?;
+        let target_name = operation
+            .target
+            .file_name()
+            .ok_or_else(|| restore_failed("Skill bundle target has no name"))?;
+        let quarantine_name = quarantine
+            .file_name()
+            .ok_or_else(|| restore_failed("Skill quarantine has no name"))?;
+        match fs::symlink_metadata(&operation.target) {
+            Ok(metadata) => {
+                if operation.action != ChangeKind::Update
+                    || metadata_is_link_or_reparse(&metadata)
+                    || !metadata.is_dir()
+                {
+                    return Err(restore_failed(
+                        "Skill bundle target type changed after planning",
+                    ));
+                }
+                let current_hash =
+                    tree_hash(&operation.target).map_err(|error| restore_failed(error.message))?;
+                if !operation
+                    .expected_previous_hash
+                    .as_deref()
+                    .is_some_and(|expected| current_hash.eq_ignore_ascii_case(expected))
+                {
+                    return Err(restore_failed("Skill bundle target changed after planning"));
+                }
+                pinned
+                    .rename_child_if_absent(target_name, quarantine_name)
+                    .map_err(|error| {
+                        restore_failed(format!("could not quarantine target Skill: {error}"))
+                    })?;
+                record_bundle_phase(
+                    transaction,
+                    &operation.target,
+                    BundlePhase::TargetQuarantined,
+                )?;
+                fault(RestoreFaultPoint::SkillTargetQuarantined)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if operation.action != ChangeKind::Add {
+                    return Err(restore_failed(
+                        "Skill bundle target disappeared after planning",
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(restore_failed(format!(
+                    "could not inspect target Skill before replacement: {error}"
+                )))
+            }
+        }
+        pinned
+            .rename_child_if_absent(stage_component, target_name)
+            .map_err(|error| {
+                restore_failed(format!(
+                    "could not atomically install target Skill: {error}"
+                ))
+            })?;
+        record_bundle_phase(transaction, &operation.target, BundlePhase::Replaced)?;
+        fault(RestoreFaultPoint::SkillBundleReplaced)?;
+        record_applied_mutation(transaction, &operation.target)?;
+        Ok((file_count, byte_count))
+    })();
+    if result.is_err()
+        && fs::symlink_metadata(&stage_path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata_is_link_or_reparse(&metadata))
+    {
+        let _ = fs::remove_dir_all(&stage_path);
+    }
+    result
+}
+
+fn apply_skill_lock(
+    plan: &RestorePlan,
+    verified: &VerifiedPackage,
+    operation: &crate::core::models::PlannedOperation,
+    transaction: &mut PreparedTransaction,
+    fault: &mut impl FnMut(RestoreFaultPoint) -> Result<(), RehomeError>,
+) -> Result<u64, RehomeError> {
+    const MAX_LOCK_BYTES: u64 = 4 * 1024 * 1024;
+
+    let package_bytes = verified.authenticated_planning_payload(&operation.package_source)?;
+    let package_lock: SkillLockFileV3 = serde_json::from_slice(package_bytes)
+        .map_err(|_| restore_failed("verified package Skill lock is invalid"))?;
+    let target_bytes = match fs::symlink_metadata(&operation.target) {
+        Ok(metadata) if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() => {
+            return Err(restore_failed(
+                "target Skill lock is no longer a regular file",
+            ));
+        }
+        Ok(metadata) if metadata.len() > MAX_LOCK_BYTES => {
+            return Err(restore_failed(
+                "target Skill lock exceeds the supported size limit",
+            ));
+        }
+        Ok(_) => Some(fs::read(&operation.target).map_err(|error| {
+            restore_failed(format!("could not read target Skill lock: {error}"))
+        })?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(restore_failed(format!(
+                "could not inspect target Skill lock: {error}"
+            )))
+        }
+    };
+    let decisions = verified
+        .preview
+        .manifest
+        .shared_skills
+        .iter()
+        .map(|skill| {
+            let action = plan
+                .operations
+                .iter()
+                .find(|candidate| candidate.content_id == Some(skill.content_id))
+                .map(|candidate| candidate.action)
+                .ok_or_else(|| restore_failed("Skill bundle decision is missing"))?;
+            Ok((skill.relative_path.clone(), action))
+        })
+        .collect::<Result<BTreeMap<_, _>, RehomeError>>()?;
+    let bytes = match merge_skill_lock(&package_lock, target_bytes.as_deref(), &decisions)
+        .map_err(|error| restore_failed(error.message))?
+    {
+        LockMergeResult::Write(bytes) => bytes,
+        LockMergeResult::Unchanged | LockMergeResult::SkippedInvalidTarget => {
+            return Err(restore_failed(
+                "target Skill lock no longer matches the writable restore plan",
+            ))
+        }
+    };
+    let final_hash = format!("{:x}", Sha256::digest(&bytes));
+    if !operation
+        .expected_final_hash
+        .as_deref()
+        .is_some_and(|expected| final_hash.eq_ignore_ascii_case(expected))
+    {
+        return Err(restore_failed(
+            "merged Skill lock changed after restore planning",
+        ));
+    }
+    let mut staged = NamedTempFile::new()
+        .map_err(|error| restore_failed(format!("could not stage merged Skill lock: {error}")))?;
+    staged
+        .write_all(&bytes)
+        .map_err(|error| restore_failed(format!("could not write merged Skill lock: {error}")))?;
+    staged
+        .as_file()
+        .sync_all()
+        .map_err(|error| restore_failed(format!("could not flush merged Skill lock: {error}")))?;
+    let root = operation_root(plan, &operation.target)?;
+    fs::create_dir_all(root).map_err(|error| {
+        restore_failed(format!("could not create Skill lock directory: {error}"))
+    })?;
+    record_file_write_intent(transaction, &operation.target)?;
+    fault(RestoreFaultPoint::BeforeSkillLockWrite)?;
+    apply_file_source_for_transaction(
+        root,
+        operation,
+        staged.path(),
+        transaction.journal.transaction_id,
+    )?;
+    fault(RestoreFaultPoint::AfterSkillLockWrite)?;
+    record_applied_mutation(transaction, &operation.target)?;
+    Ok(bytes.len() as u64)
+}
+
+struct BundleTargetLock {
+    parent: PinnedParent,
+    name: String,
+    token: String,
+}
+
+impl BundleTargetLock {
+    fn acquire(
+        parent: &Path,
+        target_name: &OsStr,
+        transaction_id: Uuid,
+    ) -> Result<Self, RehomeError> {
+        let parent = PinnedParent::open(parent)
+            .map_err(|error| restore_failed(format!("could not pin Skill lock parent: {error}")))?;
+        let name = format!(".{}.codex-rehome.lock", target_name.to_string_lossy());
+        let token = transaction_id.to_string();
+        let mut file = parent.create_new_file(OsStr::new(&name)).map_err(|error| {
+            restore_failed(format!("could not acquire Skill bundle lock: {error}"))
+        })?;
+        file.write_all(token.as_bytes()).map_err(|error| {
+            restore_failed(format!("could not write Skill bundle lock: {error}"))
+        })?;
+        file.sync_all().map_err(|error| {
+            restore_failed(format!("could not flush Skill bundle lock: {error}"))
+        })?;
+        Ok(Self {
+            parent,
+            name,
+            token,
+        })
+    }
+}
+
+impl Drop for BundleTargetLock {
+    fn drop(&mut self) {
+        let name = OsStr::new(&self.name);
+        let mut contents = String::new();
+        let owned = self
+            .parent
+            .open_file(name)
+            .and_then(|mut file| file.read_to_string(&mut contents))
+            .is_ok()
+            && contents == self.token;
+        if owned {
+            let _ = self.parent.remove_file(name);
+        }
+    }
 }
 
 fn is_bridge_operation(plan: &RestorePlan, source: &str) -> bool {
@@ -338,6 +761,8 @@ fn verify_restore(
     let bridge = verify_bridge_metadata(plan)?;
     let forbidden_files_absent = current.preview.forbidden_files_total == 0;
     let project_files_valid = verify_project_files(plan, verified)?;
+    let shared_skill_files_valid = verify_shared_skill_files(plan)?;
+    let skill_lock_merge = verify_skill_lock(plan)?;
     Ok(VerificationReport {
         package_checksum_valid,
         files_valid,
@@ -349,12 +774,17 @@ fn verify_restore(
         project_files_valid,
         app_registration_valid: false,
         app_visible_ready: false,
+        shared_skill_files_valid,
+        codex_skill_discovery: VerificationStatus::NotRun,
+        skill_lock_merge,
+        functional_sampling: VerificationStatus::NotRun,
     })
 }
 
 fn verify_plain_files(plan: &RestorePlan, verified: &VerifiedPackage) -> Result<bool, RehomeError> {
     for operation in &plan.operations {
         if operation.action == ChangeKind::Conflict
+            || operation.operation_kind != OperationKind::File
             || is_bridge_operation(plan, &operation.package_source)
         {
             continue;
@@ -410,6 +840,16 @@ fn preserved_target_matches(
             )))
         }
     };
+    if operation.operation_kind == OperationKind::SkillBundle {
+        if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+            return Ok(operation.expected_previous_hash.is_none());
+        }
+        let Some(expected) = operation.expected_previous_hash.as_deref() else {
+            return Ok(true);
+        };
+        let actual = tree_hash(&operation.target).map_err(|error| restore_failed(error.message))?;
+        return Ok(actual.eq_ignore_ascii_case(expected));
+    }
     if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
         return Ok(false);
     }
@@ -428,6 +868,7 @@ fn verify_project_files(
         .operations
         .iter()
         .filter(|operation| operation.target.starts_with(&plan.projects_root))
+        .filter(|operation| operation.operation_kind == OperationKind::File)
         .filter(|operation| operation.action != ChangeKind::Conflict)
     {
         let expected = &verified
@@ -442,6 +883,81 @@ fn verify_project_files(
         }
     }
     Ok(true)
+}
+
+fn verify_shared_skill_files(plan: &RestorePlan) -> Result<bool, RehomeError> {
+    for operation in plan
+        .operations
+        .iter()
+        .filter(|operation| operation.operation_kind == OperationKind::SkillBundle)
+    {
+        if operation.action == ChangeKind::Conflict {
+            return Ok(false);
+        }
+        if operation.action == ChangeKind::Preserve {
+            if !preserved_target_matches(operation)? {
+                return Ok(false);
+            }
+            continue;
+        }
+        let expected = operation
+            .expected_final_hash
+            .as_deref()
+            .ok_or_else(|| restore_failed("Skill bundle final tree hash is missing"))?;
+        let metadata = match fs::symlink_metadata(&operation.target) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(restore_failed(format!(
+                    "could not inspect restored Skill bundle: {error}"
+                )))
+            }
+        };
+        if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+            return Ok(false);
+        }
+        let actual = tree_hash(&operation.target).map_err(|error| restore_failed(error.message))?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Ok(false);
+        }
+        let marker = operation.target.join("SKILL.md");
+        let marker_metadata = match fs::symlink_metadata(&marker) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(restore_failed(format!(
+                    "could not inspect restored SKILL.md: {error}"
+                )))
+            }
+        };
+        if metadata_is_link_or_reparse(&marker_metadata) || !marker_metadata.is_file() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn verify_skill_lock(plan: &RestorePlan) -> Result<VerificationStatus, RehomeError> {
+    let Some(operation) = plan
+        .operations
+        .iter()
+        .find(|operation| operation.operation_kind == OperationKind::SkillLock)
+    else {
+        return Ok(VerificationStatus::Skipped);
+    };
+    if operation.action == ChangeKind::Preserve {
+        return Ok(VerificationStatus::Skipped);
+    }
+    if operation.action == ChangeKind::Unchanged && operation.expected_final_hash.is_none() {
+        return Ok(VerificationStatus::Skipped);
+    }
+    let Some(expected) = operation.expected_final_hash.as_deref() else {
+        return Ok(VerificationStatus::Failed);
+    };
+    Ok(match hash_optional_file(&operation.target)? {
+        Some(actual) if actual.eq_ignore_ascii_case(expected) => VerificationStatus::Passed,
+        _ => VerificationStatus::Failed,
+    })
 }
 
 struct BridgeVerification {
@@ -647,6 +1163,8 @@ fn data_verification_passed(report: &VerificationReport) -> bool {
         && report.path_mapping_valid
         && report.forbidden_files_absent
         && report.project_files_valid
+        && report.shared_skill_files_valid
+        && report.skill_lock_merge != VerificationStatus::Failed
 }
 
 fn operation_root<'a>(plan: &'a RestorePlan, target: &Path) -> Result<&'a Path, RehomeError> {
@@ -654,6 +1172,12 @@ fn operation_root<'a>(plan: &'a RestorePlan, target: &Path) -> Result<&'a Path, 
         Ok(&plan.target_codex_home)
     } else if target.starts_with(&plan.projects_root) {
         Ok(&plan.projects_root)
+    } else if target.starts_with(&plan.target_agents_skills_root) {
+        Ok(&plan.target_agents_skills_root)
+    } else if target == plan.target_skill_lock_path {
+        plan.target_skill_lock_path
+            .parent()
+            .ok_or_else(|| restore_failed("target Skill lock has no parent"))
     } else {
         Err(restore_failed(format!(
             "restore target escapes the planned roots: {}",
@@ -696,4 +1220,225 @@ fn timestamp() -> String {
 
 fn restore_failed(message: impl Into<String>) -> RehomeError {
     RehomeError::new(ErrorCode::RestoreFailed, message)
+}
+
+#[cfg(test)]
+mod fault_injection_tests {
+    use super::*;
+    use crate::core::{
+        models::{
+            ContentCounts, CreatePackageRequest, FileConflictResolution, SkillLockEntryV3,
+            TargetInventory,
+        },
+        package::{create_package, inspect_package},
+        planner::build_restore_plan_with_skill_resolutions,
+    };
+    use std::{
+        collections::BTreeMap,
+        env,
+        ffi::OsString,
+        panic::{catch_unwind, AssertUnwindSafe},
+        path::PathBuf,
+        sync::Mutex,
+    };
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn injected_skill_bundle_and_lock_crashes_restore_the_original_state() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _env = EnvGuard::capture("LOCALAPPDATA");
+        for point in [
+            RestoreFaultPoint::SkillTargetQuarantined,
+            RestoreFaultPoint::SkillBundleReplaced,
+            RestoreFaultPoint::BeforeSkillLockWrite,
+            RestoreFaultPoint::AfterSkillLockWrite,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap();
+            env::set_var("LOCALAPPDATA", root.join("app-data"));
+            let (plan, target_skill, target_lock, original_lock) = fault_fixture(&root);
+            let options = RestoreOptions {
+                codex_closed_confirmed: true,
+                backup_root: root.join("backups"),
+                register_projects: false,
+            };
+            let mut injected = false;
+            let crashed = catch_unwind(AssertUnwindSafe(|| {
+                let _ = apply_server_plan_with_fault(
+                    plan,
+                    options,
+                    |_, _| RegistrationStatus::ManualOpenRequired,
+                    |observed| {
+                        if observed == point && !injected {
+                            injected = true;
+                            panic!("synthetic process crash at {observed:?}");
+                        }
+                        Ok(())
+                    },
+                );
+            }));
+            assert!(injected, "fault point {point:?} was not reached");
+            assert!(crashed.is_err(), "fault point {point:?} did not crash");
+            let pending = recover_incomplete_transactions().unwrap();
+            assert_eq!(pending.len(), 1, "{point:?}: {pending:?}");
+            assert!(rollback(pending[0].transaction_id).unwrap().success);
+            assert_eq!(
+                fs::read(target_skill.join("SKILL.md")).unwrap(),
+                b"# Original Skill\n",
+                "{point:?}"
+            );
+            assert!(target_skill.join("local-only.txt").exists(), "{point:?}");
+            assert!(!target_skill.join("guide.md").exists(), "{point:?}");
+            assert_eq!(fs::read(&target_lock).unwrap(), original_lock, "{point:?}");
+            let leftovers = fs::read_dir(target_skill.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains("codex-rehome"))
+                .collect::<Vec<_>>();
+            assert!(
+                leftovers.iter().all(|name| name.ends_with(".rollback")),
+                "{point:?}: {leftovers:?}"
+            );
+            assert!(leftovers.len() <= 1, "{point:?}: {leftovers:?}");
+            let transactions = root
+                .join("app-data")
+                .join("com.rehome.desktop")
+                .join("transactions");
+            let journal_path = fs::read_dir(transactions)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .unwrap();
+            let journal: serde_json::Value =
+                serde_json::from_slice(&fs::read(journal_path).unwrap()).unwrap();
+            assert_eq!(journal["status"], "rolled_back", "{point:?}");
+        }
+    }
+
+    fn fault_fixture(root: &Path) -> (RestorePlan, PathBuf, PathBuf, Vec<u8>) {
+        let source_codex = root.join("source").join(".codex");
+        let source_agents = root.join("source").join(".agents");
+        let source_skill = source_agents.join("skills").join("fault-skill");
+        fs::create_dir_all(&source_codex).unwrap();
+        fs::create_dir_all(&source_skill).unwrap();
+        fs::write(source_skill.join("SKILL.md"), b"# Incoming Skill\n").unwrap();
+        fs::write(source_skill.join("guide.md"), b"incoming guide\n").unwrap();
+        let package_lock = SkillLockFileV3 {
+            version: 3,
+            skills: BTreeMap::from([("fault-skill".into(), lock_entry("main"))]),
+            dismissed: None,
+            last_selected_agents: None,
+        };
+        fs::write(
+            source_agents.join(".skill-lock.json"),
+            serde_json::to_vec_pretty(&package_lock).unwrap(),
+        )
+        .unwrap();
+        let package_path = root.join("fault.rehome");
+        create_package(CreatePackageRequest {
+            codex_home: source_codex,
+            project_paths: vec![],
+            conversation_ids: vec![],
+            output_path: package_path.clone(),
+            source_device_id: Uuid::nil(),
+            skill_paths: vec![],
+            shared_skill_paths: vec![source_skill],
+            plugin_paths: vec![],
+            generated_image_paths: vec![],
+        })
+        .unwrap();
+        let preview = inspect_package(&package_path).unwrap();
+
+        let target_root = root.join("target");
+        let target_codex = target_root.join(".codex");
+        let target_agents = target_root.join(".agents");
+        let target_skills = target_agents.join("skills");
+        let target_skill = target_skills.join("fault-skill");
+        let target_lock = target_agents.join(".skill-lock.json");
+        let projects = root.join("projects");
+        fs::create_dir_all(&target_codex).unwrap();
+        fs::create_dir_all(&target_skill).unwrap();
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(target_skill.join("SKILL.md"), b"# Original Skill\n").unwrap();
+        fs::write(target_skill.join("local-only.txt"), b"preserve me\n").unwrap();
+        let target_lock_file = SkillLockFileV3 {
+            version: 3,
+            skills: BTreeMap::from([
+                ("fault-skill".into(), lock_entry("target")),
+                ("unrelated".into(), lock_entry("target")),
+            ]),
+            dismissed: Some(serde_json::json!({"keep": true})),
+            last_selected_agents: Some(serde_json::json!(["codex"])),
+        };
+        let mut original_lock = serde_json::to_vec_pretty(&target_lock_file).unwrap();
+        original_lock.push(b'\n');
+        fs::write(&target_lock, &original_lock).unwrap();
+        let target = TargetInventory {
+            codex_home: target_codex,
+            agents_skills_root: target_skills,
+            skill_lock_path: target_lock.clone(),
+            target_os: if cfg!(target_os = "macos") {
+                SourceOs::Macos
+            } else {
+                SourceOs::Windows
+            },
+            target_arch: env::consts::ARCH.into(),
+            counts: ContentCounts::default(),
+            projects: vec![],
+            conversations: vec![],
+        };
+        let content_id = preview.manifest.shared_skills[0].content_id;
+        let resolutions = BTreeMap::from([(content_id, FileConflictResolution::UsePackage)]);
+        let plan = build_restore_plan_with_skill_resolutions(
+            &preview,
+            &target,
+            &projects,
+            None,
+            &resolutions,
+        )
+        .unwrap();
+        (plan, target_skill, target_lock, original_lock)
+    }
+
+    fn lock_entry(reference: &str) -> SkillLockEntryV3 {
+        SkillLockEntryV3 {
+            source: "github".into(),
+            source_type: "github".into(),
+            source_url: "https://github.com/example/synthetic-skills".into(),
+            r#ref: Some(reference.into()),
+            skill_path: Some("skills/fault-skill".into()),
+            skill_folder_hash: "a".repeat(64),
+            installed_at: "2026-08-19T00:00:00Z".into(),
+            updated_at: "2026-08-19T00:00:00Z".into(),
+            plugin_name: None,
+        }
+    }
+
+    struct EnvGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn capture(name: &'static str) -> Self {
+            Self {
+                name,
+                previous: env::var_os(name),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                env::set_var(self.name, value);
+            } else {
+                env::remove_var(self.name);
+            }
+        }
+    }
 }

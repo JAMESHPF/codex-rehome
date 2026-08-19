@@ -29,6 +29,8 @@ fn manifest_round_trip() {
         projects: vec![],
         conversations: vec![],
         exclusions: ExclusionSummary::default(),
+        shared_skills: vec![],
+        shared_skill_lock: None,
     };
 
     assert_eq!(
@@ -80,6 +82,8 @@ fn populated_manifest_preserves_source_syntax_and_portable_archive_paths() {
             classification: None,
         }],
         exclusions: ExclusionSummary::default(),
+        shared_skills: vec![],
+        shared_skill_lock: None,
     };
 
     let source_path: &String = &manifest.projects[0].source_path;
@@ -220,6 +224,10 @@ fn restore_and_recovery_contracts_use_typed_state() {
         expected_previous_hash: None,
         action: ChangeKind::Add,
         rollback_required: true,
+        root_kind: rehome_desktop_lib::core::models::RestoreRootKind::Projects,
+        operation_kind: rehome_desktop_lib::core::models::OperationKind::File,
+        content_id: None,
+        expected_final_hash: None,
     };
     let plan = RestorePlan {
         plan_id: Uuid::nil(),
@@ -228,6 +236,8 @@ fn restore_and_recovery_contracts_use_typed_state() {
         archive_hash: "archive-sha256".into(),
         target_codex_home: PathBuf::from(r"C:\Users\NewUser\.codex"),
         projects_root: PathBuf::from(r"C:\Users\NewUser\Documents"),
+        target_agents_skills_root: PathBuf::from(r"C:\Users\NewUser\.agents\skills"),
+        target_skill_lock_path: PathBuf::from(r"C:\Users\NewUser\.agents\.skill-lock.json"),
         operations: vec![operation.clone()],
         sessions: vec![],
         reference_rewrites: vec![],

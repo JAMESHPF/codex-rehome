@@ -22,10 +22,12 @@ The installer and a migration package are different files. The EXE or DMG instal
 
 - Selected projects and their files
 - Selected conversations and the local indexes needed for Codex to rediscover them
-- Skills, Plugins, and generated images
+- Shared user Skills (`~/.agents/skills`), legacy Codex Skills, Plugins, and generated images
 - Relevant local state and path mappings for selected content
 
 Project files and conversation history are separate. Selecting a conversation does not automatically include source files. Selecting a project includes its child conversations by default, while still allowing individual conversations to be deselected.
+
+Shared user Skills are shown separately from legacy `$CODEX_HOME/skills`. A shared Skill moves as one directory: when a same-name destination differs, ReHome keeps the destination by default and lets the user choose “Use package” per Skill. It never merges two Skill directories file by file. Safe supported `skills` CLI v3 lock entries follow the same decisions; a malformed or unknown destination lock remains untouched.
 
 ## Supported scenarios
 
@@ -43,6 +45,8 @@ ReHome Desktop keeps migration offline. It requires no additional account, uploa
 
 Packages exclude login tokens, cookies, `.env` files, private keys, `.git`, `node_modules`, virtual environments, and runtime lock files by default. Never upload a personal `.rehome` file to GitHub, a public post, or a public download link.
 
+If a shared Skill contains a symlink, reparse point, special file, sensitive authentication file, or high-confidence credential content, ReHome blocks the whole Skill from packaging. It reports only the file path and reason, never the credential value.
+
 ## Important limits
 
 This is not official cloud sync and it does not automatically keep two computers synchronized each day. After a cross-platform move, an old conversation can remain useful historical context while its original working-directory handle no longer works. Reopen the restored project, then continue in a new task when needed.
@@ -50,6 +54,8 @@ This is not official cloud sync and it does not automatically keep two computers
 Each `.rehome` package and individual file can currently be up to 16 GiB. Large files are streamed during creation, inspection, and restore instead of being loaded entirely into memory. Codex thread metadata has a separate 64 MiB limit.
 
 Login sessions, browser state, running terminals, unsaved work, and native system dependencies are not fully portable. Different accounts or workspaces may require fresh sign-in or authorization for external services.
+
+ReHome moves Skill content only. It does not install Node.js, Python, Git Bash/WSL, external CLIs, models, credentials, or API keys. A Skill that contains macOS scripts or machine-specific dependencies may have matching hashes and be discoverable by Codex while still requiring separate Windows runtime setup.
 
 ## Need the Skill instead?
 

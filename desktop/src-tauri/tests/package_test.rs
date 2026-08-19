@@ -5,10 +5,167 @@ use rehome_desktop_lib::core::{
     error::ErrorCode,
     models::{
         ContentCounts, ConversationEntry, CreatePackageRequest, ExclusionSummary, PackageManifest,
-        PackageMode, SourceOs,
+        PackageMode, SkillLockEntryV3, SkillLockFileV3, SourceOs,
     },
     package::{create_package, create_package_replacing, inspect_package},
 };
+
+#[test]
+fn shared_skills_create_schema_v2_with_filtered_lock_and_exclusion_totals(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = synthetic_codex_fixture()?;
+    let user_root = tempfile::tempdir()?;
+    let agents_root = fs::canonicalize(user_root.path())?.join(".agents");
+    let skills_root = agents_root.join("skills");
+    let selected = skills_root.join("pinfei-synthetic");
+    fs::create_dir_all(selected.join("node_modules"))?;
+    fs::write(selected.join("SKILL.md"), b"# Synthetic shared Skill\n")?;
+    fs::write(selected.join("guide.md"), b"portable instructions\n")?;
+    fs::write(selected.join("node_modules").join("ignored.js"), b"ignored")?;
+    fs::create_dir_all(&agents_root)?;
+    let lock = SkillLockFileV3 {
+        version: 3,
+        skills: BTreeMap::from([
+            (
+                "pinfei-synthetic".into(),
+                synthetic_lock_entry("skills/pinfei-synthetic"),
+            ),
+            (
+                "unselected".into(),
+                synthetic_lock_entry("skills/unselected"),
+            ),
+        ]),
+        dismissed: Some(serde_json::json!(["keep-local-only"])),
+        last_selected_agents: Some(serde_json::json!(["codex"])),
+    };
+    fs::write(
+        agents_root.join(".skill-lock.json"),
+        serde_json::to_vec_pretty(&lock)?,
+    )?;
+    let output_root = tempfile::tempdir()?;
+    let output = output_root.path().join("shared.rehome");
+
+    let report = create_package(CreatePackageRequest {
+        codex_home: fixture.codex_home,
+        project_paths: vec![],
+        conversation_ids: vec![],
+        output_path: output.clone(),
+        source_device_id: Uuid::nil(),
+        skill_paths: vec![],
+        shared_skill_paths: vec![selected],
+        plugin_paths: vec![],
+        generated_image_paths: vec![],
+    })?;
+    let preview = inspect_package(&output)?;
+
+    assert_eq!(report.counts.skills, 1);
+    assert_eq!(preview.manifest.schema_version, 2);
+    assert_eq!(preview.manifest.shared_skills.len(), 1);
+    let skill = &preview.manifest.shared_skills[0];
+    assert_eq!(skill.relative_path, "pinfei-synthetic");
+    assert_eq!(skill.archive_root, "agents/skills/pinfei-synthetic");
+    assert_eq!(skill.file_count, 2);
+    assert_eq!(skill.exclusions.excluded_files, 1);
+    assert_eq!(preview.manifest.exclusions.excluded_files, 1);
+    assert!(preview
+        .entries
+        .iter()
+        .any(|entry| entry == "agents/skills/pinfei-synthetic/SKILL.md"));
+    assert!(!preview
+        .entries
+        .iter()
+        .any(|entry| entry.contains("node_modules")));
+    let metadata = preview.manifest.shared_skill_lock.as_ref().unwrap();
+    assert_eq!(metadata.entry_count, 1);
+    assert_eq!(metadata.content_only_count, 0);
+    let filtered: SkillLockFileV3 = serde_json::from_slice(&read_zip_entry(
+        &output,
+        "agents/metadata/skill-lock-v3.json",
+    )?)?;
+    assert_eq!(filtered.version, 3);
+    assert_eq!(
+        filtered
+            .skills
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["pinfei-synthetic"]
+    );
+    assert!(filtered.dismissed.is_none());
+    assert!(filtered.last_selected_agents.is_none());
+    Ok(())
+}
+
+#[test]
+fn shared_skill_without_source_lock_stages_empty_content_only_metadata(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = synthetic_codex_fixture()?;
+    let root = tempfile::tempdir()?;
+    let selected = fs::canonicalize(root.path())?
+        .join(".agents")
+        .join("skills")
+        .join("content-only");
+    fs::create_dir_all(&selected)?;
+    fs::write(selected.join("SKILL.md"), b"# Content-only fixture\n")?;
+    let output_root = tempfile::tempdir()?;
+    let output = output_root.path().join("content-only.rehome");
+
+    create_package(CreatePackageRequest {
+        codex_home: fixture.codex_home,
+        project_paths: vec![],
+        conversation_ids: vec![],
+        output_path: output.clone(),
+        source_device_id: Uuid::nil(),
+        skill_paths: vec![],
+        shared_skill_paths: vec![selected],
+        plugin_paths: vec![],
+        generated_image_paths: vec![],
+    })?;
+    let preview = inspect_package(&output)?;
+    let metadata = preview.manifest.shared_skill_lock.as_ref().unwrap();
+    assert_eq!(metadata.entry_count, 0);
+    assert_eq!(metadata.content_only_count, 1);
+    let filtered: SkillLockFileV3 = serde_json::from_slice(&read_zip_entry(
+        &output,
+        "agents/metadata/skill-lock-v3.json",
+    )?)?;
+    assert!(filtered.skills.is_empty());
+    Ok(())
+}
+
+#[test]
+fn blocked_shared_skill_never_publishes_a_partial_package() -> Result<(), Box<dyn Error>> {
+    let fixture = synthetic_codex_fixture()?;
+    let root = tempfile::tempdir()?;
+    let selected = root.path().join(".agents").join("skills").join("unsafe");
+    fs::create_dir_all(&selected)?;
+    fs::write(selected.join("SKILL.md"), b"# Unsafe fixture\n")?;
+    fs::write(
+        selected.join(".env"),
+        b"SYNTHETIC_SECRET=not-a-real-secret\n",
+    )?;
+    let output_root = tempfile::tempdir()?;
+    let output = output_root.path().join("blocked.rehome");
+
+    let error = create_package(CreatePackageRequest {
+        codex_home: fixture.codex_home,
+        project_paths: vec![],
+        conversation_ids: vec![],
+        output_path: output.clone(),
+        source_device_id: Uuid::nil(),
+        skill_paths: vec![],
+        shared_skill_paths: vec![selected],
+        plugin_paths: vec![],
+        generated_image_paths: vec![],
+    })
+    .unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::PackageInvalid);
+    assert!(error.message.contains("blocked"));
+    assert!(!error.message.contains("SYNTHETIC_SECRET"));
+    assert!(!output.exists());
+    Ok(())
+}
 use rusqlite::{params, Connection};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -79,6 +236,7 @@ fn packages_selected_fixture_content_without_mutating_sources() -> Result<(), Bo
         output_path: output.clone(),
         source_device_id: Uuid::parse_str("33333333-3333-4333-8333-333333333333")?,
         skill_paths: vec![fixture.skill_path.clone()],
+        shared_skill_paths: vec![],
         plugin_paths: vec![fixture.plugin_manifest_path.clone()],
         generated_image_paths: vec![fixture.generated_image_path.clone()],
     })?;
@@ -198,6 +356,7 @@ fn package_collapses_overlapping_plugin_roots() -> Result<(), Box<dyn Error>> {
         output_path: output.clone(),
         source_device_id: Uuid::nil(),
         skill_paths: vec![],
+        shared_skill_paths: vec![],
         plugin_paths: vec![plugin_marker, nested_manifest],
         generated_image_paths: vec![],
     })?;
@@ -305,6 +464,7 @@ fn package_exports_threads_from_a_private_wal_snapshot() -> Result<(), Box<dyn E
         output_path: output,
         source_device_id: Uuid::new_v4(),
         skill_paths: vec![],
+        shared_skill_paths: vec![],
         plugin_paths: vec![],
         generated_image_paths: vec![],
     })?;
@@ -979,8 +1139,23 @@ fn package_request(
         output_path,
         source_device_id: Uuid::nil(),
         skill_paths: vec![fixture.skill_path.clone()],
+        shared_skill_paths: vec![],
         plugin_paths: vec![fixture.plugin_manifest_path.clone()],
         generated_image_paths: vec![fixture.generated_image_path.clone()],
+    }
+}
+
+fn synthetic_lock_entry(skill_path: &str) -> SkillLockEntryV3 {
+    SkillLockEntryV3 {
+        source: "github".into(),
+        source_type: "github".into(),
+        source_url: "https://github.com/example/synthetic-skills".into(),
+        r#ref: Some("main".into()),
+        skill_path: Some(skill_path.into()),
+        skill_folder_hash: "a".repeat(64),
+        installed_at: "2026-08-19T00:00:00Z".into(),
+        updated_at: "2026-08-19T00:00:00Z".into(),
+        plugin_name: None,
     }
 }
 
@@ -999,6 +1174,8 @@ fn test_manifest(schema_version: u32) -> PackageManifest {
         projects: vec![],
         conversations: vec![],
         exclusions: ExclusionSummary::default(),
+        shared_skills: vec![],
+        shared_skill_lock: None,
     }
 }
 

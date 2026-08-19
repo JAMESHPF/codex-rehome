@@ -7,16 +7,22 @@ use crate::core::{
     models::{
         ContentCounts, ConversationEntry, CreatePackageReport, CreatePackageRequest,
         ExclusionSummary, PackageManifest, PackageMode, PackagePreview, ProjectEntry,
+        SharedSkillEntry, SharedSkillLockMetadata, SkillLockFileV3,
     },
     paths::normalize_entry,
     session::{metadata_string, metadata_uuid, session_metadata_from_value, SessionMetadata},
+    shared_skills::{
+        manifest_entry_from_scan, read_supported_lock, sanitize_lock_entry,
+        scan_shared_skill_bundle, shared_skill_content_id, tree_hash_from_payload_records,
+        SupportedLock,
+    },
 };
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{types::ValueRef, Connection, OpenFlags};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     env, fs,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -29,7 +35,8 @@ use walkdir::WalkDir;
 use zip::{write::SimpleFileOptions, CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
 const FORMAT: &str = "codex-rehome";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION_V1: u32 = 1;
+const SCHEMA_VERSION_V2: u32 = 2;
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_CONTROL_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PLANNING_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
@@ -166,6 +173,29 @@ fn create_package_with_overwrite(
             false,
         )?;
     }
+    let mut shared_skills = Vec::new();
+    let mut shared_skill_lock = None;
+    if !request.shared_skill_paths.is_empty() {
+        let staged = stage_shared_skills(
+            &request.shared_skill_paths,
+            inventory.agents_skills_canonical_root.as_deref(),
+            inventory.skill_lock_path.as_deref(),
+            staging.path(),
+            &mut payloads,
+        )?;
+        counts.skills = counts
+            .skills
+            .checked_add(staged.entries.len() as u64)
+            .ok_or_else(|| package_invalid("selected Skill count overflowed"))?;
+        excluded_files = excluded_files
+            .checked_add(staged.excluded_files)
+            .ok_or_else(|| package_invalid("excluded file count overflowed"))?;
+        excluded_bytes = excluded_bytes
+            .checked_add(staged.excluded_bytes)
+            .ok_or_else(|| package_invalid("excluded byte count overflowed"))?;
+        shared_skills = staged.entries;
+        shared_skill_lock = Some(staged.lock_metadata);
+    }
     if !request.plugin_paths.is_empty() {
         counts.plugins = stage_discovered_trees(
             &request.plugin_paths,
@@ -189,7 +219,11 @@ fn create_package_with_overwrite(
     let package_id = Uuid::new_v4();
     let manifest = PackageManifest {
         format: FORMAT.to_owned(),
-        schema_version: SCHEMA_VERSION,
+        schema_version: if shared_skills.is_empty() {
+            SCHEMA_VERSION_V1
+        } else {
+            SCHEMA_VERSION_V2
+        },
         package_id,
         created_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
         source_os: inventory.source_os,
@@ -208,6 +242,8 @@ fn create_package_with_overwrite(
                 .map(|rule| (*rule).to_owned())
                 .collect(),
         },
+        shared_skills,
+        shared_skill_lock,
     };
 
     let checksums = render_checksums(&payloads);
@@ -415,13 +451,16 @@ pub(crate) fn inspect_package_for_planning(path: &Path) -> Result<VerifiedPackag
     if manifest.format != FORMAT {
         return Err(package_invalid("manifest format is not codex-rehome"));
     }
-    if manifest.schema_version != SCHEMA_VERSION {
+    if !matches!(
+        manifest.schema_version,
+        SCHEMA_VERSION_V1 | SCHEMA_VERSION_V2
+    ) {
         return Err(RehomeError::new(
             ErrorCode::UnsupportedSchema,
             format!("unsupported package schema {}", manifest.schema_version),
         ));
     }
-    validate_manifest_archive_paths(&manifest, &file_paths, &payload_hashes)?;
+    validate_manifest_archive_paths(&manifest, &file_paths, &payload_hashes, &payloads)?;
 
     let checksum_bytes = checksum_bytes
         .as_deref()
@@ -438,6 +477,9 @@ pub(crate) fn inspect_package_for_planning(path: &Path) -> Result<VerifiedPackag
             planning_sources.insert(source.to_owned());
         }
     }
+    if let Some(lock) = manifest.shared_skill_lock.as_ref() {
+        planning_sources.insert(lock.archive_path.clone());
+    }
     let mut planning_payloads = BTreeMap::new();
     for source in planning_sources {
         let mut entry = archive.by_name(&source).map_err(|error| {
@@ -452,6 +494,7 @@ pub(crate) fn inspect_package_for_planning(path: &Path) -> Result<VerifiedPackag
         authenticate_payload_bytes(&bytes, payload)?;
         planning_payloads.insert(source, bytes);
     }
+    validate_shared_lock_payload(&manifest, &planning_payloads)?;
 
     let mut file = archive.into_inner();
     file.seek(SeekFrom::Start(0))
@@ -908,6 +951,150 @@ fn sqlite_json_value(value: ValueRef<'_>) -> Result<Value, RehomeError> {
             }
             Value::String(format!("hex:{}", hex_bytes(value)))
         }
+    })
+}
+
+struct StagedSharedSkills {
+    entries: Vec<SharedSkillEntry>,
+    lock_metadata: SharedSkillLockMetadata,
+    excluded_files: u64,
+    excluded_bytes: u64,
+}
+
+fn stage_shared_skills(
+    bundle_paths: &[PathBuf],
+    discovered_root: Option<&Path>,
+    discovered_lock_path: Option<&Path>,
+    staging_root: &Path,
+    payloads: &mut PayloadCollection,
+) -> Result<StagedSharedSkills, RehomeError> {
+    let first = bundle_paths
+        .first()
+        .ok_or_else(|| package_invalid("shared Skill selection is empty"))?;
+    let first_metadata = fs::symlink_metadata(first).map_err(io_package_error)?;
+    if first_metadata.file_type().is_symlink() || !first_metadata.is_dir() {
+        return Err(package_invalid(
+            "selected shared Skill must be a real directory",
+        ));
+    }
+    let first_parent = first
+        .parent()
+        .ok_or_else(|| package_invalid("selected shared Skill has no parent"))?;
+    let canonical_root = fs::canonicalize(first_parent).map_err(io_package_error)?;
+    let mut canonical_bundles = BTreeMap::new();
+    for source in bundle_paths {
+        let metadata = fs::symlink_metadata(source).map_err(io_package_error)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(package_invalid(
+                "selected shared Skill must be a real directory",
+            ));
+        }
+        let canonical = fs::canonicalize(source).map_err(io_package_error)?;
+        if canonical.parent() != Some(canonical_root.as_path()) {
+            return Err(package_invalid(
+                "selected shared Skills must be direct children of one shared root",
+            ));
+        }
+        if canonical_bundles
+            .insert(canonical.clone(), source.clone())
+            .is_some()
+        {
+            return Err(package_invalid("selected shared Skill is duplicated"));
+        }
+    }
+
+    let use_discovered_lock = discovered_root
+        .and_then(|root| fs::canonicalize(root).ok())
+        .is_some_and(|root| root == canonical_root);
+    let lock_path = if use_discovered_lock {
+        discovered_lock_path.map(Path::to_path_buf)
+    } else {
+        canonical_root
+            .parent()
+            .map(|parent| parent.join(".skill-lock.json"))
+    };
+    let source_lock = lock_path
+        .as_deref()
+        .map(read_supported_lock)
+        .unwrap_or(SupportedLock::Missing);
+
+    let mut scans = Vec::new();
+    for canonical in canonical_bundles.keys() {
+        let scan = scan_shared_skill_bundle(&canonical_root, canonical)
+            .map_err(|error| package_invalid(error.message))?;
+        if let Some(reason) = scan.entry.blocked_reason.as_deref() {
+            return Err(package_invalid(format!(
+                "selected shared Skill {} is blocked: {reason}",
+                scan.entry.relative_path
+            )));
+        }
+        scans.push(scan);
+    }
+    scans.sort_by(|left, right| left.entry.relative_path.cmp(&right.entry.relative_path));
+
+    let mut selected_lock = BTreeMap::new();
+    if let SupportedLock::Available(lock) = &source_lock {
+        for scan in &scans {
+            if let Some(entry) = lock
+                .skills
+                .get(&scan.entry.relative_path)
+                .and_then(sanitize_lock_entry)
+            {
+                selected_lock.insert(scan.entry.relative_path.clone(), entry);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    let mut excluded_files = 0_u64;
+    let mut excluded_bytes = 0_u64;
+    for scan in scans {
+        let lock_key = selected_lock
+            .contains_key(&scan.entry.relative_path)
+            .then(|| scan.entry.relative_path.clone());
+        let manifest_entry = manifest_entry_from_scan(&scan, lock_key)
+            .map_err(|error| package_invalid(error.message))?;
+        for file in &scan.files {
+            let archive_path = format!("{}/{}", manifest_entry.archive_root, file.relative_path);
+            stage_source(&file.source_path, staging_root, payloads, &archive_path)?;
+        }
+        excluded_files = excluded_files
+            .checked_add(manifest_entry.exclusions.excluded_files)
+            .ok_or_else(|| package_invalid("shared Skill exclusion count overflowed"))?;
+        excluded_bytes = excluded_bytes
+            .checked_add(manifest_entry.exclusions.excluded_bytes)
+            .ok_or_else(|| package_invalid("shared Skill excluded bytes overflowed"))?;
+        entries.push(manifest_entry);
+    }
+
+    const ARCHIVE_PATH: &str = "agents/metadata/skill-lock-v3.json";
+    let content_only_count = entries
+        .len()
+        .checked_sub(selected_lock.len())
+        .ok_or_else(|| package_invalid("shared Skill lock count is inconsistent"))?
+        as u64;
+    let filtered = SkillLockFileV3 {
+        version: 3,
+        skills: selected_lock,
+        dismissed: None,
+        last_selected_agents: None,
+    };
+    let bytes = serde_json::to_vec_pretty(&filtered).map_err(|error| {
+        package_invalid(format!("could not serialize filtered Skill lock: {error}"))
+    })?;
+    ensure_planning_payload_size(ARCHIVE_PATH, bytes.len() as u64)?;
+    stage_generated(staging_root, payloads, ARCHIVE_PATH, &bytes)?;
+    let lock_metadata = SharedSkillLockMetadata {
+        archive_path: ARCHIVE_PATH.to_owned(),
+        entry_count: filtered.skills.len() as u64,
+        content_only_count,
+    };
+
+    Ok(StagedSharedSkills {
+        entries,
+        lock_metadata,
+        excluded_files,
+        excluded_bytes,
     })
 }
 
@@ -1381,7 +1568,24 @@ fn validate_manifest_archive_paths(
     manifest: &PackageManifest,
     file_paths: &HashSet<String>,
     payload_hashes: &BTreeMap<String, String>,
+    payloads: &BTreeMap<String, VerifiedPayload>,
 ) -> Result<(), RehomeError> {
+    match manifest.schema_version {
+        SCHEMA_VERSION_V1
+            if !manifest.shared_skills.is_empty() || manifest.shared_skill_lock.is_some() =>
+        {
+            return Err(package_invalid(
+                "schema v1 manifest must not contain shared Skills metadata",
+            ));
+        }
+        SCHEMA_VERSION_V2 if manifest.shared_skills.is_empty() => {
+            return Err(package_invalid(
+                "schema v2 manifest must contain at least one shared Skill",
+            ));
+        }
+        SCHEMA_VERSION_V1 | SCHEMA_VERSION_V2 => {}
+        _ => unreachable!("schema version is checked before manifest validation"),
+    }
     let mut referenced_conversations = PortablePathRegistry::default();
     for conversation in &manifest.conversations {
         let path = validate_manifest_archive_path(&conversation.archive_path)?;
@@ -1426,6 +1630,190 @@ fn validate_manifest_archive_paths(
                 ));
             }
         }
+    }
+    validate_shared_skill_manifest(manifest, file_paths, payloads)?;
+    Ok(())
+}
+
+fn validate_shared_skill_manifest(
+    manifest: &PackageManifest,
+    file_paths: &HashSet<String>,
+    payloads: &BTreeMap<String, VerifiedPayload>,
+) -> Result<(), RehomeError> {
+    let mut covered_payloads = HashSet::new();
+    let mut portable_names = PortablePathRegistry::default();
+    let mut content_ids = HashSet::new();
+    let mut lock_keys = HashSet::new();
+    for skill in &manifest.shared_skills {
+        if skill.root_kind != crate::core::models::SkillRootKind::SharedAgents {
+            return Err(package_invalid(
+                "shared Skill manifest contains an unsupported root kind",
+            ));
+        }
+        let relative = validate_manifest_archive_path(&skill.relative_path)?;
+        if relative.contains('/')
+            || shared_skill_content_id(&relative) != skill.content_id
+            || !content_ids.insert(skill.content_id)
+        {
+            return Err(package_invalid(
+                "shared Skill manifest identity is invalid or duplicated",
+            ));
+        }
+        portable_names.insert(&relative, ArchivePathKind::Directory)?;
+        let expected_root = format!("agents/skills/{relative}");
+        if validate_manifest_archive_path(&skill.archive_root)? != expected_root {
+            return Err(package_invalid(
+                "shared Skill archive root does not match its relative path",
+            ));
+        }
+        let prefix = format!("{expected_root}/");
+        let mut records = Vec::new();
+        let mut content_bytes = 0_u64;
+        let mut has_marker = false;
+        for (source, payload) in payloads
+            .iter()
+            .filter(|(source, _)| source.starts_with(&prefix))
+        {
+            let relative_file = source
+                .strip_prefix(&prefix)
+                .ok_or_else(|| package_invalid("shared Skill payload path is malformed"))?;
+            if relative_file == "SKILL.md" {
+                has_marker = true;
+            }
+            content_bytes = content_bytes
+                .checked_add(payload.size_bytes)
+                .ok_or_else(|| package_invalid("shared Skill payload size overflowed"))?;
+            records.push((
+                relative_file,
+                payload.size_bytes,
+                payload.content_hash.as_str(),
+            ));
+            covered_payloads.insert(source.clone());
+        }
+        if !has_marker
+            || records.len() as u64 != skill.file_count
+            || content_bytes != skill.content_bytes
+        {
+            return Err(package_invalid(
+                "shared Skill manifest counts or SKILL.md marker do not match payloads",
+            ));
+        }
+        let actual_tree_hash = tree_hash_from_payload_records(records.into_iter())
+            .map_err(|error| package_invalid(error.message))?;
+        if !actual_tree_hash.eq_ignore_ascii_case(&skill.tree_hash) {
+            return Err(package_invalid(
+                "shared Skill tree hash does not match package payloads",
+            ));
+        }
+        if let Some(lock_key) = skill.lock_key.as_deref() {
+            if lock_key != skill.relative_path || !lock_keys.insert(lock_key.to_owned()) {
+                return Err(package_invalid(
+                    "shared Skill lock key is invalid or duplicated",
+                ));
+            }
+        }
+    }
+
+    let agents_skill_payloads = payloads
+        .keys()
+        .filter(|source| source.starts_with("agents/skills/"))
+        .cloned()
+        .collect::<HashSet<_>>();
+    if agents_skill_payloads != covered_payloads {
+        return Err(package_invalid(
+            "package contains unreferenced shared Skill payloads",
+        ));
+    }
+
+    if manifest.schema_version == SCHEMA_VERSION_V2 {
+        match manifest.shared_skill_lock.as_ref() {
+            Some(metadata) => {
+                if metadata.archive_path != "agents/metadata/skill-lock-v3.json"
+                    || !file_paths.contains(&metadata.archive_path)
+                    || metadata.entry_count != lock_keys.len() as u64
+                    || metadata
+                        .entry_count
+                        .checked_add(metadata.content_only_count)
+                        != Some(manifest.shared_skills.len() as u64)
+                {
+                    return Err(package_invalid(
+                        "shared Skill lock metadata does not match the manifest",
+                    ));
+                }
+            }
+            None => {
+                return Err(package_invalid(
+                    "schema v2 shared Skills require filtered lock metadata",
+                ));
+            }
+        }
+    }
+
+    let expected_lock = manifest
+        .shared_skill_lock
+        .as_ref()
+        .map(|metadata| metadata.archive_path.as_str());
+    for source in payloads
+        .keys()
+        .filter(|source| source.starts_with("agents/"))
+    {
+        if source.starts_with("agents/skills/") || Some(source.as_str()) == expected_lock {
+            continue;
+        }
+        return Err(package_invalid(
+            "package contains an unsupported agents payload",
+        ));
+    }
+    if manifest.schema_version == SCHEMA_VERSION_V1
+        && payloads.keys().any(|source| source.starts_with("agents/"))
+    {
+        return Err(package_invalid(
+            "schema v1 package contains agents payloads",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_shared_lock_payload(
+    manifest: &PackageManifest,
+    planning_payloads: &BTreeMap<String, Vec<u8>>,
+) -> Result<(), RehomeError> {
+    let Some(metadata) = manifest.shared_skill_lock.as_ref() else {
+        return Ok(());
+    };
+    let bytes = planning_payloads
+        .get(&metadata.archive_path)
+        .ok_or_else(|| package_invalid("verified shared Skill lock bytes are missing"))?;
+    let lock: SkillLockFileV3 = serde_json::from_slice(bytes)
+        .map_err(|_| package_invalid("filtered shared Skill lock is invalid"))?;
+    if lock.version != 3
+        || lock.dismissed.is_some()
+        || lock.last_selected_agents.is_some()
+        || lock.skills.len() as u64 != metadata.entry_count
+    {
+        return Err(package_invalid(
+            "filtered shared Skill lock contains unsupported metadata",
+        ));
+    }
+    let expected_keys = manifest
+        .shared_skills
+        .iter()
+        .filter_map(|skill| skill.lock_key.as_deref())
+        .collect::<BTreeSet<_>>();
+    let actual_keys = lock
+        .skills
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if expected_keys != actual_keys
+        || lock
+            .skills
+            .values()
+            .any(|entry| sanitize_lock_entry(entry).as_ref() != Some(entry))
+    {
+        return Err(package_invalid(
+            "filtered shared Skill lock entries are unsafe or inconsistent",
+        ));
     }
     Ok(())
 }

@@ -1,3 +1,7 @@
+#[allow(dead_code)]
+mod common;
+
+use common::{test_agents_skills_root, test_skill_lock_path};
 use rehome_desktop_lib::core::{
     bridge::apply_bridge_plan,
     error::ErrorCode,
@@ -1119,6 +1123,8 @@ fn maps_project_targets_with_the_target_operating_system_syntax() -> Result<(), 
         let preview = project_only_preview(temp.path())?;
         let target = TargetInventory {
             codex_home: PathBuf::from(case.codex_home),
+            agents_skills_root: test_agents_skills_root(case.target_os),
+            skill_lock_path: test_skill_lock_path(case.target_os),
             target_os: case.target_os,
             target_arch: "x86_64".into(),
             counts: ContentCounts::default(),
@@ -1144,6 +1150,8 @@ fn package_projects_cannot_silently_share_a_target_directory() -> Result<(), Box
     let target_root = temp_root.join("target");
     let target = TargetInventory {
         codex_home: target_root.join(".codex"),
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -1238,6 +1246,8 @@ fn project_target_names_use_unicode_normalized_collision_rules() -> Result<(), B
     fs::create_dir_all(&codex_home)?;
     let target = TargetInventory {
         codex_home,
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -1264,6 +1274,8 @@ fn macos_project_target_names_use_case_insensitive_unicode_collision_rules(
         preview = inspect_package(&preview.package_path)?;
         let target = TargetInventory {
             codex_home: PathBuf::from("/Users/test/.codex"),
+            agents_skills_root: test_agents_skills_root(SourceOs::Macos),
+            skill_lock_path: test_skill_lock_path(SourceOs::Macos),
             target_os: SourceOs::Macos,
             target_arch: "aarch64".into(),
             counts: ContentCounts::default(),
@@ -1420,6 +1432,8 @@ fn planner_fixture(target_os: Option<SourceOs>) -> Result<PlannerFixture, Box<dy
         }],
         conversations: vec![conversation(checksum(&session_bytes))],
         exclusions: ExclusionSummary::default(),
+        shared_skills: vec![],
+        shared_skill_lock: None,
     };
     let thread_metadata = thread_metadata_bytes();
     let index = index_bytes();
@@ -1440,6 +1454,8 @@ fn planner_fixture(target_os: Option<SourceOs>) -> Result<PlannerFixture, Box<dy
     let target_os = target_os.unwrap_or_else(current_source_os);
     let target = TargetInventory {
         codex_home,
+        agents_skills_root: test_agents_skills_root(target_os),
+        skill_lock_path: test_skill_lock_path(target_os),
         target_os,
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -1556,6 +1572,8 @@ fn shared_metadata_fixture() -> Result<PlannerFixture, Box<dyn Error>> {
             ),
         ],
         exclusions: ExclusionSummary::default(),
+        shared_skills: vec![],
+        shared_skill_lock: None,
     };
     let source_rows = [
         serde_json::json!({
@@ -1665,6 +1683,8 @@ fn shared_metadata_fixture() -> Result<PlannerFixture, Box<dyn Error>> {
     fs::write(codex_home.join("session_index.jsonl"), ready_index)?;
     let target = TargetInventory {
         codex_home,
+        agents_skills_root: test_agents_skills_root(current_source_os()),
+        skill_lock_path: test_skill_lock_path(current_source_os()),
         target_os: current_source_os(),
         target_arch: "x86_64".into(),
         counts: ContentCounts::default(),
@@ -1826,6 +1846,8 @@ fn project_preview(root: &Path, duplicate_target: bool) -> Result<PackagePreview
         projects,
         conversations: vec![],
         exclusions: ExclusionSummary::default(),
+        shared_skills: vec![],
+        shared_skill_lock: None,
     };
     let mut payloads = vec![
         (PROJECT_SOURCE, b"incoming project\n".as_slice()),

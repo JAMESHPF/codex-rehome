@@ -2,9 +2,11 @@ use crate::core::{
     bridge::{validate_restore_target, validate_restore_target_ancestry},
     error::{ErrorCode, RehomeError},
     models::{
-        PendingRecovery, RecoveryStatus, RestorePlan, RollbackReport, TransactionHistory,
-        TransactionSummary,
+        BackupKind, OperationKind, PendingRecovery, RecoveryStatus, RestorePlan, RollbackReport,
+        TransactionHistory, TransactionSummary,
     },
+    paths::normalize_entry,
+    shared_skills::tree_hash,
     stable_fs::PinnedParent,
 };
 use chrono::{SecondsFormat, Utc};
@@ -13,24 +15,28 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::{self, Read},
     path::{Component, Path, PathBuf},
     time::Duration,
 };
 use tempfile::NamedTempFile;
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 const APP_IDENTIFIER: &str = "com.rehome.desktop";
 const TRANSACTIONS_DIRECTORY: &str = "transactions";
 const SQLITE_SIDECARS: &[&str] = &["-wal", "-shm", "-journal"];
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum BackupKind {
-    File,
-    Absent,
-}
+type MutableTarget = (
+    String,
+    PathBuf,
+    Option<String>,
+    Option<String>,
+    OperationKind,
+);
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +54,7 @@ pub(crate) enum RollbackProgress {
 pub(crate) enum AppliedState {
     Absent,
     File { hash: String, identity: String },
+    Directory { tree_hash: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,12 +69,16 @@ pub(crate) struct BackupOperation {
     pub package_source: String,
     pub target: PathBuf,
     pub backup_kind: BackupKind,
+    #[serde(default)]
+    pub operation_kind: OperationKind,
     pub backup_path: Option<PathBuf>,
     pub original_hash: Option<String>,
     #[serde(default)]
     pub original_target_hash: Option<String>,
     #[serde(default)]
     pub applied_hash: Option<String>,
+    #[serde(default)]
+    pub expected_final_hash: Option<String>,
     #[serde(default)]
     pub applied_state: Option<AppliedState>,
     #[serde(default)]
@@ -78,6 +89,25 @@ pub(crate) struct BackupOperation {
     pub rollback_progress: RollbackProgress,
     #[serde(default)]
     pub rollback_quarantine: Option<String>,
+    #[serde(default)]
+    pub apply_quarantine: Option<String>,
+    #[serde(default)]
+    pub apply_staging: Option<String>,
+    #[serde(default)]
+    pub bundle_phase: BundlePhase,
+    #[serde(default)]
+    pub write_intent: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BundlePhase {
+    #[default]
+    None,
+    Staged,
+    TargetQuarantined,
+    Replaced,
+    Cleaned,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,6 +120,10 @@ pub(crate) struct TransactionJournal {
     pub backup_root: PathBuf,
     pub target_codex_home: PathBuf,
     pub projects_root: PathBuf,
+    #[serde(default)]
+    pub target_agents_skills_root: PathBuf,
+    #[serde(default)]
+    pub target_skill_lock_path: PathBuf,
     #[serde(default)]
     pub locks: Vec<JournalLock>,
 }
@@ -118,9 +152,28 @@ pub(crate) fn prepare_transaction(
     };
     let codex_home = fs::canonicalize(&plan.target_codex_home)
         .map_err(|error| restore_failed(format!("could not canonicalize Codex home: {error}")))?;
-    if paths_overlap(&backup_root, &projects_root) || paths_overlap(&backup_root, &codex_home) {
+    let agents_skills_root = match fs::canonicalize(&plan.target_agents_skills_root) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            plan.target_agents_skills_root.clone()
+        }
+        Err(error) => {
+            return Err(restore_failed(format!(
+                "could not canonicalize shared Skills root: {error}"
+            )))
+        }
+    };
+    let lock_root = plan
+        .target_skill_lock_path
+        .parent()
+        .ok_or_else(|| restore_failed("target Skill lock has no parent"))?;
+    if paths_overlap(&backup_root, &projects_root)
+        || paths_overlap(&backup_root, &codex_home)
+        || paths_overlap(&backup_root, &agents_skills_root)
+        || paths_overlap(&backup_root, lock_root)
+    {
         return Err(restore_failed(
-            "transaction backup directory must not overlap the project directory or Codex home",
+            "transaction backup directory must not overlap any restore root",
         ));
     }
     let app_data = app_data_root()?;
@@ -145,10 +198,24 @@ pub(crate) fn prepare_transaction(
 
     let targets = mutable_targets(plan)?;
     let mut operations = Vec::with_capacity(targets.len());
-    for (index, (package_source, target, expected_hash)) in targets.into_iter().enumerate() {
+    for (index, (package_source, target, expected_hash, expected_final_hash, operation_kind)) in
+        targets.into_iter().enumerate()
+    {
         let root = operation_root(plan, &target)?;
-        validate_restore_target(root, &target)?;
-        let operation = if package_source == "codex/metadata/threads.json" {
+        if operation_kind == OperationKind::SkillBundle {
+            validate_restore_target_ancestry(root, &target)?;
+        } else {
+            validate_restore_target(root, &target)?;
+        }
+        let mut operation = if operation_kind == OperationKind::SkillBundle {
+            backup_directory(
+                &objects,
+                index,
+                package_source,
+                target,
+                expected_hash.as_deref(),
+            )?
+        } else if package_source == "codex/metadata/threads.json" {
             backup_sqlite_database(
                 &objects,
                 index,
@@ -165,8 +232,10 @@ pub(crate) fn prepare_transaction(
                 package_source,
                 target,
                 expected_hash.as_deref(),
+                operation_kind,
             )?
         };
+        operation.expected_final_hash = expected_final_hash;
         operations.push(operation);
     }
 
@@ -187,6 +256,7 @@ pub(crate) fn prepare_transaction(
             let applied_state = inspect_applied_state(&operations[index])?;
             operations[index].applied_hash = match &applied_state {
                 AppliedState::File { hash, .. } => Some(hash.clone()),
+                AppliedState::Directory { tree_hash } => Some(tree_hash.clone()),
                 AppliedState::Absent => None,
             };
             operations[index].applied_state = Some(applied_state);
@@ -212,6 +282,8 @@ pub(crate) fn prepare_transaction(
         backup_root,
         target_codex_home: plan.target_codex_home.clone(),
         projects_root: plan.projects_root.clone(),
+        target_agents_skills_root: plan.target_agents_skills_root.clone(),
+        target_skill_lock_path: plan.target_skill_lock_path.clone(),
         locks,
     };
     let journal_path = transactions.join(format!("{transaction_id}.json"));
@@ -232,6 +304,166 @@ pub(crate) fn update_status(
 ) -> Result<(), RehomeError> {
     prepared.journal.status = status;
     write_journal(&prepared.journal_path, &prepared.journal)
+}
+
+pub(crate) fn begin_bundle_swap(
+    prepared: &mut PreparedTransaction,
+    target: &Path,
+) -> Result<PathBuf, RehomeError> {
+    let index = prepared
+        .journal
+        .operations
+        .iter()
+        .position(|operation| {
+            operation.target == target && operation.operation_kind == OperationKind::SkillBundle
+        })
+        .ok_or_else(|| restore_failed("Skill bundle is missing from the transaction journal"))?;
+    let expected = bundle_apply_quarantine_name(prepared.journal.transaction_id, index);
+    match prepared.journal.operations[index]
+        .apply_quarantine
+        .as_deref()
+    {
+        Some(recorded) if recorded != expected => {
+            return Err(restore_failed(
+                "transaction journal contains invalid Skill quarantine ownership",
+            ))
+        }
+        Some(_) => {}
+        None => prepared.journal.operations[index].apply_quarantine = Some(expected.clone()),
+    }
+    prepared.journal.operations[index].bundle_phase = BundlePhase::Staged;
+    write_journal(&prepared.journal_path, &prepared.journal)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| restore_failed("Skill bundle target has no parent"))?;
+    Ok(parent.join(expected))
+}
+
+pub(crate) fn begin_bundle_stage(
+    prepared: &mut PreparedTransaction,
+    target: &Path,
+) -> Result<PathBuf, RehomeError> {
+    let index = prepared
+        .journal
+        .operations
+        .iter()
+        .position(|operation| {
+            operation.target == target && operation.operation_kind == OperationKind::SkillBundle
+        })
+        .ok_or_else(|| restore_failed("Skill bundle is missing from the transaction journal"))?;
+    let expected = bundle_stage_name(prepared.journal.transaction_id, index);
+    match prepared.journal.operations[index].apply_staging.as_deref() {
+        Some(recorded) if recorded != expected => {
+            return Err(restore_failed(
+                "transaction journal contains invalid Skill staging ownership",
+            ))
+        }
+        Some(_) => {}
+        None => prepared.journal.operations[index].apply_staging = Some(expected.clone()),
+    }
+    prepared.journal.operations[index].bundle_phase = BundlePhase::Staged;
+    write_journal(&prepared.journal_path, &prepared.journal)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| restore_failed("Skill bundle target has no parent"))?;
+    Ok(parent.join(expected))
+}
+
+pub(crate) fn record_bundle_phase(
+    prepared: &mut PreparedTransaction,
+    target: &Path,
+    phase: BundlePhase,
+) -> Result<(), RehomeError> {
+    let operation = prepared
+        .journal
+        .operations
+        .iter_mut()
+        .find(|operation| {
+            operation.target == target && operation.operation_kind == OperationKind::SkillBundle
+        })
+        .ok_or_else(|| restore_failed("Skill bundle is missing from the transaction journal"))?;
+    operation.bundle_phase = phase;
+    write_journal(&prepared.journal_path, &prepared.journal)
+}
+
+pub(crate) fn record_file_write_intent(
+    prepared: &mut PreparedTransaction,
+    target: &Path,
+) -> Result<(), RehomeError> {
+    let operation = prepared
+        .journal
+        .operations
+        .iter_mut()
+        .find(|operation| operation.target == target)
+        .ok_or_else(|| restore_failed("write-intent target is missing from the journal"))?;
+    if operation.operation_kind != OperationKind::SkillLock
+        || operation.expected_final_hash.is_none()
+    {
+        return Err(restore_failed(
+            "write intent is only supported for a planned Skill lock update",
+        ));
+    }
+    operation.write_intent = true;
+    write_journal(&prepared.journal_path, &prepared.journal)
+}
+
+pub(crate) fn cleanup_bundle_quarantines(
+    prepared: &mut PreparedTransaction,
+) -> Result<(), RehomeError> {
+    let indices = prepared
+        .journal
+        .operations
+        .iter()
+        .enumerate()
+        .filter(|(_, operation)| operation.operation_kind == OperationKind::SkillBundle)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    for index in indices {
+        let operation = prepared.journal.operations[index].clone();
+        let Some(name) = operation.apply_quarantine.as_deref() else {
+            continue;
+        };
+        let parent = operation
+            .target
+            .parent()
+            .ok_or_else(|| restore_failed("Skill bundle target has no parent"))?;
+        let quarantine = parent.join(name);
+        match fs::symlink_metadata(&quarantine) {
+            Ok(metadata) if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() => {
+                return Err(restore_failed(
+                    "owned Skill quarantine is not a real directory",
+                ))
+            }
+            Ok(_) => {
+                let expected = operation
+                    .original_hash
+                    .as_deref()
+                    .ok_or_else(|| restore_failed("Skill directory backup hash is missing"))?;
+                if !hash_directory_full(&quarantine)?.eq_ignore_ascii_case(expected) {
+                    return Err(restore_failed(
+                        "owned Skill quarantine changed before cleanup",
+                    ));
+                }
+                fs::remove_dir_all(&quarantine).map_err(|error| {
+                    restore_failed(format!("could not remove owned Skill quarantine: {error}"))
+                })?;
+                sync_directory(parent).map_err(|error| {
+                    restore_failed(format!(
+                        "could not sync Skill parent after cleanup: {error}"
+                    ))
+                })?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(restore_failed(format!(
+                    "could not inspect owned Skill quarantine: {error}"
+                )))
+            }
+        }
+        prepared.journal.operations[index].bundle_phase = BundlePhase::Cleaned;
+        write_journal(&prepared.journal_path, &prepared.journal)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn record_applied_mutation(
@@ -267,9 +499,11 @@ pub(crate) fn record_applied_mutation(
         let applied_state = inspect_applied_state(operation)?;
         prepared.journal.operations[index].applied_hash = match &applied_state {
             AppliedState::File { hash, .. } => Some(hash.clone()),
+            AppliedState::Directory { tree_hash } => Some(tree_hash.clone()),
             AppliedState::Absent => None,
         };
         prepared.journal.operations[index].applied_state = Some(applied_state);
+        prepared.journal.operations[index].write_intent = false;
     }
     if include_sidecars {
         let database_hash = prepared.journal.operations[index]
@@ -304,19 +538,31 @@ pub(crate) fn ensure_applied_states(prepared: &PreparedTransaction) -> Result<()
 
 fn inspect_applied_state(operation: &BackupOperation) -> Result<AppliedState, RehomeError> {
     match fs::symlink_metadata(&operation.target) {
-        Ok(metadata) if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() => {
-            Err(restore_failed(format!(
-                "restored target is not a regular file: {}",
-                operation.target.display()
-            )))
+        Ok(metadata) if metadata_is_link_or_reparse(&metadata) => Err(restore_failed(format!(
+            "restored target is a symbolic link or reparse point: {}",
+            operation.target.display()
+        ))),
+        Ok(metadata)
+            if operation.operation_kind == OperationKind::SkillBundle && metadata.is_dir() =>
+        {
+            Ok(AppliedState::Directory {
+                tree_hash: tree_hash(&operation.target)
+                    .map_err(|error| restore_failed(error.message))?,
+            })
         }
-        Ok(_) => {
+        Ok(metadata)
+            if operation.operation_kind != OperationKind::SkillBundle && metadata.is_file() =>
+        {
             let hash = hash_file(&operation.target)?;
             Ok(AppliedState::File {
                 hash,
                 identity: file_identity(&operation.target)?,
             })
         }
+        Ok(_) => Err(restore_failed(format!(
+            "restored target type does not match its operation: {}",
+            operation.target.display()
+        ))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(AppliedState::Absent),
         Err(error) => Err(restore_failed(format!(
             "could not inspect restored target {}: {error}",
@@ -504,6 +750,7 @@ fn transaction_summary_from_journal(journal: TransactionJournal) -> TransactionS
         backup_root: journal.backup_root,
         target_codex_home: journal.target_codex_home,
         projects_root: journal.projects_root,
+        target_agents_skills_root: journal.target_agents_skills_root,
         restored_project_paths,
         changed_files: journal.operations.len() as u64,
     }
@@ -620,9 +867,7 @@ fn journal_id_from_path(path: &Path) -> Result<Uuid, RehomeError> {
         .map_err(|_| rollback_failed("transaction journal file name is not a UUID"))
 }
 
-fn mutable_targets(
-    plan: &RestorePlan,
-) -> Result<Vec<(String, PathBuf, Option<String>)>, RehomeError> {
+fn mutable_targets(plan: &RestorePlan) -> Result<Vec<MutableTarget>, RehomeError> {
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
     let mut sqlite_database = None;
@@ -646,6 +891,8 @@ fn mutable_targets(
             operation.package_source.clone(),
             operation.target.clone(),
             operation.expected_previous_hash.clone(),
+            operation.expected_final_hash.clone(),
+            operation.operation_kind,
         ));
         if operation.package_source == "codex/metadata/threads.json" {
             sqlite_database = Some(operation.target.clone());
@@ -659,11 +906,201 @@ fn mutable_targets(
                     format!("codex/metadata/sqlite-sidecar{suffix}"),
                     sidecar,
                     None,
+                    None,
+                    OperationKind::File,
                 ));
             }
         }
     }
     Ok(targets)
+}
+
+fn backup_directory(
+    objects: &Path,
+    index: usize,
+    package_source: String,
+    target: PathBuf,
+    expected_hash: Option<&str>,
+) -> Result<BackupOperation, RehomeError> {
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() => {
+            Err(restore_failed(format!(
+                "shared Skill target is not a real directory: {}",
+                target.display()
+            )))
+        }
+        Ok(metadata) => {
+            let before_tree = tree_hash(&target).map_err(|error| restore_failed(error.message))?;
+            if expected_hash.is_some_and(|expected| !before_tree.eq_ignore_ascii_case(expected)) {
+                return Err(restore_failed(format!(
+                    "shared Skill target changed after planning: {}",
+                    target.display()
+                )));
+            }
+            let relative = PathBuf::from("objects").join(format!("{index:08}.dir"));
+            let destination = objects.join(format!("{index:08}.dir"));
+            copy_directory_tree(&target, &destination)?;
+            let backup_hash = hash_directory_full(&destination)?;
+            let source_hash = hash_directory_full(&target)?;
+            let after_tree = tree_hash(&target).map_err(|error| restore_failed(error.message))?;
+            if backup_hash != source_hash || after_tree != before_tree {
+                return Err(restore_failed(format!(
+                    "shared Skill target changed while it was backed up: {}",
+                    target.display()
+                )));
+            }
+            Ok(BackupOperation {
+                package_source,
+                target,
+                backup_kind: BackupKind::Directory,
+                operation_kind: OperationKind::SkillBundle,
+                backup_path: Some(relative),
+                original_hash: Some(backup_hash),
+                original_target_hash: Some(before_tree),
+                applied_hash: None,
+                expected_final_hash: None,
+                applied_state: None,
+                applied_database_hash: None,
+                readonly: Some(metadata.permissions().readonly()),
+                unix_mode: unix_mode(&metadata),
+                rollback_progress: RollbackProgress::Pending,
+                rollback_quarantine: None,
+                apply_quarantine: None,
+                apply_staging: None,
+                bundle_phase: BundlePhase::None,
+                write_intent: false,
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if expected_hash.is_some() {
+                return Err(restore_failed(format!(
+                    "shared Skill target disappeared after planning: {}",
+                    target.display()
+                )));
+            }
+            Ok(BackupOperation {
+                package_source,
+                target,
+                backup_kind: BackupKind::Absent,
+                operation_kind: OperationKind::SkillBundle,
+                backup_path: None,
+                original_hash: None,
+                original_target_hash: None,
+                applied_hash: None,
+                expected_final_hash: None,
+                applied_state: None,
+                applied_database_hash: None,
+                readonly: None,
+                unix_mode: None,
+                rollback_progress: RollbackProgress::Pending,
+                rollback_quarantine: None,
+                apply_quarantine: None,
+                apply_staging: None,
+                bundle_phase: BundlePhase::None,
+                write_intent: false,
+            })
+        }
+        Err(error) => Err(restore_failed(format!(
+            "could not inspect shared Skill target {}: {error}",
+            target.display()
+        ))),
+    }
+}
+
+fn copy_directory_tree(source: &Path, destination: &Path) -> Result<(), RehomeError> {
+    fs::create_dir(destination)
+        .map_err(|error| restore_failed(format!("could not create directory backup: {error}")))?;
+    for entry in WalkDir::new(source).follow_links(false).sort_by_file_name() {
+        let entry = entry.map_err(|error| {
+            restore_failed(format!("could not walk directory backup source: {error}"))
+        })?;
+        if entry.path() == source {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(source)
+            .map_err(|_| restore_failed("directory backup entry escapes its source"))?;
+        normalize_entry(relative).map_err(|error| restore_failed(error.message))?;
+        let target = destination.join(relative);
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+            restore_failed(format!("could not inspect directory backup entry: {error}"))
+        })?;
+        if metadata_is_link_or_reparse(&metadata) {
+            return Err(restore_failed(
+                "directory backup source contains a symbolic link or reparse point",
+            ));
+        }
+        if metadata.is_dir() {
+            fs::create_dir(&target).map_err(|error| {
+                restore_failed(format!("could not create directory backup entry: {error}"))
+            })?;
+            fs::set_permissions(&target, metadata.permissions()).map_err(|error| {
+                restore_failed(format!("could not preserve directory permissions: {error}"))
+            })?;
+        } else if metadata.is_file() {
+            fs::copy(entry.path(), &target).map_err(|error| {
+                restore_failed(format!("could not copy directory backup file: {error}"))
+            })?;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .open(&target)
+                .map_err(|error| restore_failed(format!("could not open backup file: {error}")))?;
+            file.sync_all()
+                .map_err(|error| restore_failed(format!("could not flush backup file: {error}")))?;
+        } else {
+            return Err(restore_failed(
+                "directory backup source contains a special filesystem entry",
+            ));
+        }
+    }
+    sync_directory(destination)
+        .map_err(|error| restore_failed(format!("could not flush directory backup: {error}")))
+}
+
+fn hash_directory_full(root: &Path) -> Result<String, RehomeError> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"rehome-directory-backup-v1\0");
+    for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
+        let entry = entry.map_err(|error| {
+            restore_failed(format!("could not walk directory for hashing: {error}"))
+        })?;
+        if entry.path() == root {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|_| restore_failed("directory hash entry escapes its root"))?;
+        let relative = normalize_entry(relative).map_err(|error| restore_failed(error.message))?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+            restore_failed(format!("could not inspect directory hash entry: {error}"))
+        })?;
+        if metadata_is_link_or_reparse(&metadata) {
+            return Err(restore_failed(
+                "directory hash contains a symbolic link or reparse point",
+            ));
+        }
+        hasher.update((relative.len() as u64).to_be_bytes());
+        hasher.update(relative.as_bytes());
+        if metadata.is_dir() {
+            hasher.update(b"d");
+        } else if metadata.is_file() {
+            hasher.update(b"f");
+            hasher.update(metadata.len().to_be_bytes());
+            let mut file = fs::File::open(entry.path()).map_err(|error| {
+                restore_failed(format!("could not read directory hash entry: {error}"))
+            })?;
+            io::copy(&mut file, &mut hasher).map_err(|error| {
+                restore_failed(format!("could not hash directory entry: {error}"))
+            })?;
+        } else {
+            return Err(restore_failed(
+                "directory hash contains a special filesystem entry",
+            ));
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn backup_target(
@@ -672,6 +1109,7 @@ fn backup_target(
     package_source: String,
     target: PathBuf,
     expected_hash: Option<&str>,
+    operation_kind: OperationKind,
 ) -> Result<BackupOperation, RehomeError> {
     match fs::symlink_metadata(&target) {
         Ok(metadata) if metadata_is_link_or_reparse(&metadata) || !metadata.is_file() => {
@@ -703,16 +1141,22 @@ fn backup_target(
                 package_source,
                 target,
                 backup_kind: BackupKind::File,
+                operation_kind,
                 backup_path: Some(relative),
                 original_hash: Some(before_hash.clone()),
                 original_target_hash: Some(before_hash),
                 applied_hash: None,
+                expected_final_hash: None,
                 applied_state: None,
                 applied_database_hash: None,
                 readonly: Some(metadata.permissions().readonly()),
                 unix_mode: unix_mode(&metadata),
                 rollback_progress: RollbackProgress::Pending,
                 rollback_quarantine: None,
+                apply_quarantine: None,
+                apply_staging: None,
+                bundle_phase: BundlePhase::None,
+                write_intent: false,
             })
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -726,16 +1170,22 @@ fn backup_target(
                 package_source,
                 target,
                 backup_kind: BackupKind::Absent,
+                operation_kind,
                 backup_path: None,
                 original_hash: None,
                 original_target_hash: None,
                 applied_hash: None,
+                expected_final_hash: None,
                 applied_state: None,
                 applied_database_hash: None,
                 readonly: None,
                 unix_mode: None,
                 rollback_progress: RollbackProgress::Pending,
                 rollback_quarantine: None,
+                apply_quarantine: None,
+                apply_staging: None,
+                bundle_phase: BundlePhase::None,
+                write_intent: false,
             })
         }
         Err(error) => Err(restore_failed(format!(
@@ -822,16 +1272,22 @@ fn backup_sqlite_database(
         package_source,
         target,
         backup_kind: BackupKind::File,
+        operation_kind: OperationKind::File,
         backup_path: Some(relative),
         original_hash: Some(original_hash),
         original_target_hash: Some(before_hash),
         applied_hash: None,
+        expected_final_hash: None,
         applied_state: None,
         applied_database_hash: None,
         readonly: Some(metadata.permissions().readonly()),
         unix_mode: unix_mode(&metadata),
         rollback_progress: RollbackProgress::Pending,
         rollback_quarantine: None,
+        apply_quarantine: None,
+        apply_staging: None,
+        bundle_phase: BundlePhase::None,
+        write_intent: false,
     })
 }
 
@@ -864,16 +1320,19 @@ fn backup_sqlite_sidecar(
     };
     let original_hash = applied_state.as_ref().and_then(|state| match state {
         AppliedState::File { hash, .. } => Some(hash.clone()),
+        AppliedState::Directory { .. } => None,
         AppliedState::Absent => None,
     });
     Ok(BackupOperation {
         package_source,
         target,
         backup_kind: BackupKind::Absent,
+        operation_kind: OperationKind::File,
         backup_path: None,
         original_hash: original_hash.clone(),
         original_target_hash: original_hash.clone(),
         applied_hash: original_hash.clone(),
+        expected_final_hash: None,
         // Existing WAL/SHM content is already folded into the coherent SQLite
         // snapshot. Record its identity so rollback can quarantine that exact
         // file and finish with a self-contained database and no stale sidecar.
@@ -883,6 +1342,10 @@ fn backup_sqlite_sidecar(
         unix_mode: None,
         rollback_progress: RollbackProgress::Pending,
         rollback_quarantine: None,
+        apply_quarantine: None,
+        apply_staging: None,
+        bundle_phase: BundlePhase::None,
+        write_intent: false,
     })
 }
 
@@ -907,7 +1370,12 @@ fn rollback_loaded(
         Ok(journal
             .operations
             .iter()
-            .filter(|operation| operation.backup_kind == BackupKind::File)
+            .filter(|operation| {
+                matches!(
+                    operation.backup_kind,
+                    BackupKind::File | BackupKind::Directory
+                )
+            })
             .count() as u64)
     })();
 
@@ -935,9 +1403,43 @@ fn rollback_operation(
     journal: &mut TransactionJournal,
     index: usize,
 ) -> Result<(), RehomeError> {
-    let operation = journal.operations[index].clone();
+    let mut operation = journal.operations[index].clone();
+    if operation.operation_kind == OperationKind::SkillBundle {
+        return rollback_skill_bundle(journal_path, journal, index);
+    }
     if operation.rollback_progress == RollbackProgress::OriginalRestored {
         return verify_original_operation_state(&operation);
+    }
+    if operation.rollback_progress == RollbackProgress::Pending
+        && operation.applied_state.is_none()
+        && operation.write_intent
+    {
+        let detected = inspect_applied_state(&operation)?;
+        let matches_intended_write = match (&detected, operation.expected_final_hash.as_deref()) {
+            (AppliedState::File { hash, .. }, Some(expected)) => {
+                hash.eq_ignore_ascii_case(expected)
+            }
+            _ => false,
+        };
+        if matches_intended_write {
+            journal.operations[index].applied_hash = match &detected {
+                AppliedState::File { hash, .. } => Some(hash.clone()),
+                _ => None,
+            };
+            journal.operations[index].applied_state = Some(detected);
+            journal.operations[index].write_intent = false;
+            write_journal(journal_path, journal)?;
+            operation = journal.operations[index].clone();
+        } else {
+            verify_original_operation_state(&operation)?;
+            journal.operations[index].write_intent = false;
+            return record_rollback_progress(
+                journal_path,
+                journal,
+                index,
+                RollbackProgress::OriginalRestored,
+            );
+        }
     }
     if operation.rollback_progress == RollbackProgress::Pending && operation.applied_state.is_none()
     {
@@ -973,6 +1475,11 @@ fn rollback_operation(
                     index,
                     RollbackProgress::TargetQuarantined,
                 )?;
+            }
+            Some(AppliedState::Directory { .. }) => {
+                return Err(rollback_failed(
+                    "file rollback operation contains a directory applied state",
+                ));
             }
             None => unreachable!(),
         }
@@ -1040,6 +1547,248 @@ fn rollback_operation(
         index,
         RollbackProgress::OriginalRestored,
     )
+}
+
+fn rollback_skill_bundle(
+    journal_path: &Path,
+    journal: &mut TransactionJournal,
+    index: usize,
+) -> Result<(), RehomeError> {
+    let operation = journal.operations[index].clone();
+    if operation.rollback_progress == RollbackProgress::OriginalRestored {
+        return verify_original_operation_state(&operation);
+    }
+
+    quarantine_owned_bundle_stage(journal, index, &operation)?;
+
+    let apply_quarantine = operation
+        .apply_quarantine
+        .as_deref()
+        .map(|name| {
+            if name != bundle_apply_quarantine_name(journal.transaction_id, index) {
+                return Err(rollback_failed(
+                    "transaction journal contains invalid Skill apply quarantine ownership",
+                ));
+            }
+            let parent = operation
+                .target
+                .parent()
+                .ok_or_else(|| rollback_failed("Skill bundle target has no parent"))?;
+            Ok(parent.join(name))
+        })
+        .transpose()?;
+
+    let target_state = match fs::symlink_metadata(&operation.target) {
+        Ok(metadata) if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() => {
+            return Err(rollback_failed(format!(
+                "rollback Skill target is not a real directory: {}",
+                operation.target.display()
+            )))
+        }
+        Ok(_) => {
+            Some(tree_hash(&operation.target).map_err(|error| rollback_failed(error.message))?)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(rollback_failed(format!(
+                "could not inspect rollback Skill target: {error}"
+            )))
+        }
+    };
+    let original_tree = operation.original_target_hash.as_deref();
+    let applied_tree = operation
+        .applied_state
+        .as_ref()
+        .and_then(|state| match state {
+            AppliedState::Directory { tree_hash } => Some(tree_hash.as_str()),
+            _ => None,
+        })
+        .or(operation.expected_final_hash.as_deref());
+
+    if let Some(current) = target_state.as_deref() {
+        if original_tree.is_some_and(|original| current.eq_ignore_ascii_case(original))
+            && apply_quarantine
+                .as_deref()
+                .is_none_or(|path| !path.exists())
+        {
+            return record_rollback_progress(
+                journal_path,
+                journal,
+                index,
+                RollbackProgress::OriginalRestored,
+            );
+        }
+        if !applied_tree.is_some_and(|applied| current.eq_ignore_ascii_case(applied)) {
+            return Err(rollback_failed(format!(
+                "rollback conflict: target Skill changed after restore: {}",
+                operation.target.display()
+            )));
+        }
+        let quarantine = ensure_rollback_quarantine(journal_path, journal, index)?;
+        quarantine_target(journal, &journal.operations[index], &quarantine)?;
+        let quarantine_path = operation
+            .target
+            .parent()
+            .ok_or_else(|| rollback_failed("Skill bundle target has no parent"))?
+            .join(&quarantine);
+        let quarantined_hash =
+            tree_hash(&quarantine_path).map_err(|error| rollback_failed(error.message))?;
+        if !quarantined_hash.eq_ignore_ascii_case(current) {
+            return Err(rollback_failed(
+                "rollback conflict: quarantined Skill hash changed",
+            ));
+        }
+        record_rollback_progress(
+            journal_path,
+            journal,
+            index,
+            RollbackProgress::TargetRemoved,
+        )?;
+    }
+
+    match operation.backup_kind {
+        BackupKind::Directory => {
+            let mut restored_from_quarantine = false;
+            if let Some(quarantine) = apply_quarantine.as_deref() {
+                match fs::symlink_metadata(quarantine) {
+                    Ok(metadata)
+                        if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() =>
+                    {
+                        return Err(rollback_failed(
+                            "owned Skill apply quarantine is not a real directory",
+                        ))
+                    }
+                    Ok(_) => {
+                        let expected = operation.original_hash.as_deref().ok_or_else(|| {
+                            rollback_failed("Skill directory backup hash is missing")
+                        })?;
+                        if !hash_directory_full(quarantine)?.eq_ignore_ascii_case(expected) {
+                            return Err(rollback_failed(
+                                "owned Skill apply quarantine changed before rollback",
+                            ));
+                        }
+                        let parent = operation
+                            .target
+                            .parent()
+                            .ok_or_else(|| rollback_failed("Skill bundle target has no parent"))?;
+                        let pinned = PinnedParent::open(parent).map_err(|error| {
+                            rollback_failed(format!("could not pin Skill rollback parent: {error}"))
+                        })?;
+                        pinned
+                            .rename_child_if_absent(
+                                quarantine.file_name().ok_or_else(|| {
+                                    rollback_failed("Skill apply quarantine has no name")
+                                })?,
+                                operation
+                                    .target
+                                    .file_name()
+                                    .ok_or_else(|| rollback_failed("Skill target has no name"))?,
+                            )
+                            .map_err(|error| {
+                                rollback_failed(format!(
+                                    "could not restore quarantined target Skill: {error}"
+                                ))
+                            })?;
+                        restored_from_quarantine = true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(rollback_failed(format!(
+                            "could not inspect Skill apply quarantine: {error}"
+                        )))
+                    }
+                }
+            }
+            if !restored_from_quarantine {
+                restore_backup_directory(journal, &operation)?;
+            }
+        }
+        BackupKind::Absent => {
+            verify_bundle_target_absent(&operation)?;
+        }
+        BackupKind::File => {
+            return Err(rollback_failed(
+                "Skill bundle transaction contains a file backup",
+            ))
+        }
+    }
+    verify_original_operation_state(&operation)?;
+    record_rollback_progress(
+        journal_path,
+        journal,
+        index,
+        RollbackProgress::OriginalRestored,
+    )
+}
+
+fn bundle_apply_quarantine_name(transaction_id: Uuid, index: usize) -> String {
+    format!(".codex-rehome-{transaction_id}-{index:08}.previous")
+}
+
+fn bundle_stage_name(transaction_id: Uuid, index: usize) -> String {
+    format!(".codex-rehome-{transaction_id}-{index:08}.stage")
+}
+
+fn quarantine_owned_bundle_stage(
+    journal: &TransactionJournal,
+    index: usize,
+    operation: &BackupOperation,
+) -> Result<(), RehomeError> {
+    let Some(name) = operation.apply_staging.as_deref() else {
+        return Ok(());
+    };
+    if name != bundle_stage_name(journal.transaction_id, index) {
+        return Err(rollback_failed(
+            "transaction journal contains invalid Skill staging ownership",
+        ));
+    }
+    let parent = operation
+        .target
+        .parent()
+        .ok_or_else(|| rollback_failed("Skill bundle target has no parent"))?;
+    let stage = parent.join(name);
+    let metadata = match fs::symlink_metadata(&stage) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(rollback_failed(format!(
+                "could not inspect owned Skill staging directory: {error}"
+            )))
+        }
+    };
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(rollback_failed(
+            "owned Skill staging path is not a real directory",
+        ));
+    }
+    if operation.bundle_phase == BundlePhase::Staged {
+        // The process may have stopped before ReHome could prove that it had
+        // created and completely populated this path. Preserve it in place.
+        return Ok(());
+    }
+    let expected = operation
+        .expected_final_hash
+        .as_deref()
+        .ok_or_else(|| rollback_failed("Skill staging tree hash is missing"))?;
+    let actual = tree_hash(&stage).map_err(|error| rollback_failed(error.message))?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(rollback_failed(
+            "owned Skill staging directory changed before recovery",
+        ));
+    }
+    let evidence = format!("{name}.rollback");
+    let pinned = PinnedParent::open(parent)
+        .map_err(|error| rollback_failed(format!("could not pin Skill staging parent: {error}")))?;
+    pinned
+        .rename_child_if_absent(OsStr::new(name), OsStr::new(&evidence))
+        .map_err(|error| {
+            rollback_failed(format!(
+                "could not quarantine owned Skill staging directory: {error}"
+            ))
+        })?;
+    pinned
+        .sync()
+        .map_err(|error| rollback_failed(format!("could not sync Skill staging parent: {error}")))
 }
 
 fn record_rollback_progress(
@@ -1144,6 +1893,34 @@ fn rollback_order(journal: &TransactionJournal) -> Vec<usize> {
 }
 
 fn verify_original_operation_state(operation: &BackupOperation) -> Result<(), RehomeError> {
+    if operation.operation_kind == OperationKind::SkillBundle {
+        return match operation.backup_kind {
+            BackupKind::Absent => verify_bundle_target_absent(operation),
+            BackupKind::Directory => {
+                let metadata = fs::symlink_metadata(&operation.target).map_err(|error| {
+                    rollback_failed(format!("could not inspect restored target Skill: {error}"))
+                })?;
+                if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+                    return Err(rollback_failed(
+                        "restored target Skill is not a real directory",
+                    ));
+                }
+                let expected = operation.original_target_hash.as_deref().ok_or_else(|| {
+                    rollback_failed("Skill directory backup has no original tree hash")
+                })?;
+                let actual =
+                    tree_hash(&operation.target).map_err(|error| rollback_failed(error.message))?;
+                if actual.eq_ignore_ascii_case(expected) {
+                    Ok(())
+                } else {
+                    Err(rollback_failed("restored target Skill tree hash changed"))
+                }
+            }
+            BackupKind::File => Err(rollback_failed(
+                "Skill bundle transaction contains a file backup",
+            )),
+        };
+    }
     if operation.backup_kind == BackupKind::Absent {
         return verify_target_absent(
             operation,
@@ -1167,6 +1944,19 @@ fn verify_original_operation_state(operation: &BackupOperation) -> Result<(), Re
             "rollback conflict: restored original hash changed: {}",
             operation.target.display()
         )))
+    }
+}
+
+fn verify_bundle_target_absent(operation: &BackupOperation) -> Result<(), RehomeError> {
+    match fs::symlink_metadata(&operation.target) {
+        Ok(_) => Err(rollback_failed(format!(
+            "rollback conflict: target Skill is present: {}",
+            operation.target.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(rollback_failed(format!(
+            "could not inspect rollback Skill target: {error}"
+        ))),
     }
 }
 
@@ -1238,6 +2028,17 @@ fn validate_rollback_inputs(journal: &TransactionJournal) -> Result<(), RehomeEr
                     "backup object hash does not match its journal",
                 ));
             }
+        } else if operation.backup_kind == BackupKind::Directory {
+            let backup = backup_directory_path(journal, operation)?;
+            let expected = operation
+                .original_hash
+                .as_deref()
+                .ok_or_else(|| rollback_failed("directory backup has no original hash"))?;
+            if !hash_directory_full(&backup)?.eq_ignore_ascii_case(expected) {
+                return Err(rollback_failed(
+                    "directory backup hash does not match its journal",
+                ));
+            }
         }
         if let Some(quarantine) = operation.rollback_quarantine.as_deref() {
             if quarantine != rollback_quarantine_name(journal.transaction_id, index) {
@@ -1253,6 +2054,42 @@ fn validate_rollback_inputs(journal: &TransactionJournal) -> Result<(), RehomeEr
         {
             return Err(rollback_failed(
                 "transaction journal is missing rollback quarantine ownership",
+            ));
+        }
+        if let Some(quarantine) = operation.apply_quarantine.as_deref() {
+            if operation.operation_kind != OperationKind::SkillBundle
+                || quarantine != bundle_apply_quarantine_name(journal.transaction_id, index)
+            {
+                return Err(rollback_failed(
+                    "transaction journal contains invalid Skill apply quarantine ownership",
+                ));
+            }
+        }
+        if let Some(staging) = operation.apply_staging.as_deref() {
+            if operation.operation_kind != OperationKind::SkillBundle
+                || staging != bundle_stage_name(journal.transaction_id, index)
+            {
+                return Err(rollback_failed(
+                    "transaction journal contains invalid Skill staging ownership",
+                ));
+            }
+        }
+        if operation.operation_kind == OperationKind::SkillBundle
+            && operation.bundle_phase != BundlePhase::None
+            && operation.apply_staging.is_none()
+        {
+            return Err(rollback_failed(
+                "transaction journal is missing Skill staging ownership",
+            ));
+        }
+        if operation.write_intent
+            && (operation.operation_kind != OperationKind::SkillLock
+                || operation.expected_final_hash.is_none()
+                || operation.applied_state.is_some()
+                || operation.rollback_progress != RollbackProgress::Pending)
+        {
+            return Err(rollback_failed(
+                "transaction journal contains an invalid Skill lock write intent",
             ));
         }
     }
@@ -1401,6 +2238,63 @@ fn restore_backup_file(
         .map_err(|error| rollback_failed(format!("could not flush restored backup: {error}")))
 }
 
+fn restore_backup_directory(
+    journal: &TransactionJournal,
+    operation: &BackupOperation,
+) -> Result<(), RehomeError> {
+    let root = operation_root_from_journal(journal, &operation.target)?;
+    validate_rollback_target_ancestry(root, &operation.target)?;
+    let parent = operation
+        .target
+        .parent()
+        .ok_or_else(|| rollback_failed("Skill bundle target has no parent"))?;
+    fs::create_dir_all(parent).map_err(|error| {
+        rollback_failed(format!("could not create Skill rollback parent: {error}"))
+    })?;
+    validate_rollback_target_ancestry(root, &operation.target)?;
+    let backup = backup_directory_path(journal, operation)?;
+    let expected = operation
+        .original_hash
+        .as_deref()
+        .ok_or_else(|| rollback_failed("Skill directory backup hash is missing"))?;
+    if !hash_directory_full(&backup)?.eq_ignore_ascii_case(expected) {
+        return Err(rollback_failed(
+            "Skill directory backup hash does not match its journal",
+        ));
+    }
+    let temporary_name = format!(".codex-rehome-{}.restore", Uuid::new_v4());
+    let temporary = parent.join(&temporary_name);
+    copy_directory_tree(&backup, &temporary)?;
+    let result = (|| {
+        if !hash_directory_full(&temporary)?.eq_ignore_ascii_case(expected) {
+            return Err(rollback_failed(
+                "copied Skill directory backup hash changed",
+            ));
+        }
+        let pinned = PinnedParent::open(parent).map_err(|error| {
+            rollback_failed(format!("could not pin Skill rollback parent: {error}"))
+        })?;
+        pinned
+            .rename_child_if_absent(
+                OsStr::new(&temporary_name),
+                operation
+                    .target
+                    .file_name()
+                    .ok_or_else(|| rollback_failed("Skill bundle target has no name"))?,
+            )
+            .map_err(|error| {
+                rollback_failed(format!("could not restore Skill directory backup: {error}"))
+            })
+    })();
+    if result.is_err()
+        && fs::symlink_metadata(&temporary)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata_is_link_or_reparse(&metadata))
+    {
+        let _ = fs::remove_dir_all(&temporary);
+    }
+    result
+}
+
 fn validate_rollback_target_ancestry(root: &Path, target: &Path) -> Result<(), RehomeError> {
     validate_restore_target_ancestry(root, target).map_err(|error| rollback_failed(error.message))
 }
@@ -1445,6 +2339,10 @@ fn validate_journal(journal: &TransactionJournal) -> Result<(), RehomeError> {
     if !journal.backup_root.is_absolute()
         || !journal.target_codex_home.is_absolute()
         || !journal.projects_root.is_absolute()
+        || !journal.target_agents_skills_root.as_os_str().is_empty()
+            && !journal.target_agents_skills_root.is_absolute()
+        || !journal.target_skill_lock_path.as_os_str().is_empty()
+            && !journal.target_skill_lock_path.is_absolute()
     {
         return Err(rollback_failed(
             "transaction journal contains a relative root",
@@ -1473,6 +2371,15 @@ fn validate_journal(journal: &TransactionJournal) -> Result<(), RehomeError> {
                 let _ = backup_file_path(journal, operation)?;
                 if operation.original_hash.is_none() {
                     return Err(rollback_failed("file backup is missing its original hash"));
+                }
+            }
+            BackupKind::Directory => {
+                let _ = backup_directory_path(journal, operation)?;
+                if operation.operation_kind != OperationKind::SkillBundle
+                    || operation.original_hash.is_none()
+                    || operation.original_target_hash.is_none()
+                {
+                    return Err(rollback_failed("directory backup metadata is incomplete"));
                 }
             }
             BackupKind::Absent
@@ -1594,27 +2501,78 @@ fn backup_file_path(
     Ok(canonical)
 }
 
+fn backup_directory_path(
+    journal: &TransactionJournal,
+    operation: &BackupOperation,
+) -> Result<PathBuf, RehomeError> {
+    let relative = operation
+        .backup_path
+        .as_deref()
+        .ok_or_else(|| rollback_failed("directory backup has no object path"))?;
+    validate_relative_path(relative)?;
+    let transaction_root = journal.backup_root.join(journal.transaction_id.to_string());
+    let path = transaction_root.join(relative);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| rollback_failed(format!("could not inspect directory backup: {error}")))?;
+    if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(rollback_failed(
+            "directory backup object is not a real directory",
+        ));
+    }
+    let canonical = fs::canonicalize(&path)
+        .map_err(|error| rollback_failed(format!("could not resolve directory backup: {error}")))?;
+    let canonical_root = fs::canonicalize(&transaction_root).map_err(|error| {
+        rollback_failed(format!("could not resolve transaction backup: {error}"))
+    })?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(rollback_failed(
+            "directory backup object escapes the transaction backup",
+        ));
+    }
+    Ok(canonical)
+}
+
 fn operation_root<'a>(plan: &'a RestorePlan, target: &Path) -> Result<&'a Path, RehomeError> {
-    choose_root(&plan.target_codex_home, &plan.projects_root, target)
+    choose_root(
+        &plan.target_codex_home,
+        &plan.projects_root,
+        &plan.target_agents_skills_root,
+        &plan.target_skill_lock_path,
+        target,
+    )
 }
 
 fn operation_root_from_journal<'a>(
     journal: &'a TransactionJournal,
     target: &Path,
 ) -> Result<&'a Path, RehomeError> {
-    choose_root(&journal.target_codex_home, &journal.projects_root, target)
-        .map_err(|error| rollback_failed(error.message))
+    choose_root(
+        &journal.target_codex_home,
+        &journal.projects_root,
+        &journal.target_agents_skills_root,
+        &journal.target_skill_lock_path,
+        target,
+    )
+    .map_err(|error| rollback_failed(error.message))
 }
 
 fn choose_root<'a>(
     codex_home: &'a Path,
     projects_root: &'a Path,
+    agents_skills_root: &'a Path,
+    skill_lock_path: &'a Path,
     target: &Path,
 ) -> Result<&'a Path, RehomeError> {
     if target.starts_with(codex_home) {
         Ok(codex_home)
     } else if target.starts_with(projects_root) {
         Ok(projects_root)
+    } else if !agents_skills_root.as_os_str().is_empty() && target.starts_with(agents_skills_root) {
+        Ok(agents_skills_root)
+    } else if target == skill_lock_path {
+        skill_lock_path
+            .parent()
+            .ok_or_else(|| restore_failed("target Skill lock has no parent"))
     } else {
         Err(restore_failed(format!(
             "restore target escapes the planned roots: {}",

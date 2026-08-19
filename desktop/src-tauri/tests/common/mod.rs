@@ -11,6 +11,36 @@ const THREAD_TITLE: &str = "Synthetic migration thread";
 const THREAD_PREVIEW: &str = "Synthetic migration thread preview";
 const SOURCE_ROLLOUT_PATH: &str = r"C:\Users\OldUser\.codex\sessions\2026\07\22\rollout-2026-07-22T00-00-00-11111111-1111-4111-8111-111111111111.jsonl";
 
+#[allow(dead_code)]
+pub fn test_agents_skills_root(os: rehome_desktop_lib::core::models::SourceOs) -> PathBuf {
+    match os {
+        rehome_desktop_lib::core::models::SourceOs::Macos => canonical_temp_dir()
+            .join("codex-rehome-unused-agents")
+            .join("skills"),
+        rehome_desktop_lib::core::models::SourceOs::Windows => {
+            PathBuf::from(r"C:\Users\ReHome\.agents\skills")
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn test_skill_lock_path(os: rehome_desktop_lib::core::models::SourceOs) -> PathBuf {
+    match os {
+        rehome_desktop_lib::core::models::SourceOs::Macos => canonical_temp_dir()
+            .join("codex-rehome-unused-agents")
+            .join(".skill-lock.json"),
+        rehome_desktop_lib::core::models::SourceOs::Windows => {
+            PathBuf::from(r"C:\Users\ReHome\.agents\.skill-lock.json")
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn canonical_temp_dir() -> PathBuf {
+    let temp_dir = std::env::temp_dir();
+    fs::canonicalize(&temp_dir).unwrap_or(temp_dir)
+}
+
 pub struct SyntheticCodexFixture {
     _temp_dir: TempDir,
     pub root: PathBuf,

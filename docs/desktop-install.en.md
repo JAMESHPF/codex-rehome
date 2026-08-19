@@ -35,19 +35,23 @@ The updater signature verifies that the package came from this project and was n
 
 ## Workflow
 
-- Old computer: choose Send, select projects and conversations, and create a `.rehome` file.
+- Old computer: choose Send, select projects, conversations, and shared user Skills, then create a `.rehome` file.
 - Transfer that file privately by external drive, local network, cloud drive, or private messaging.
 - New computer: install and sign in to Codex once, fully quit Codex, choose Receive, review the restore plan, and confirm.
 - Restore is merge-safe by default. The app backs up destination state, maps Windows/macOS paths, merges conversation indexes, and registers restored projects through Codex's official project entry point.
+- A conflicting shared Skill keeps the destination version by default. Choosing “Use package” replaces the whole directory with a rollback backup instead of mixing files. A malformed or unknown destination Skill lock is never overwritten.
 
 ## System impact
 
 ReHome Desktop reads or writes only after confirmation, and only within:
 
 - the current user's Codex data directory, such as `~/.codex`;
+- the current user's shared Skills directory and v3 lock, such as `~/.agents/skills` and `~/.agents/.skill-lock.json`;
 - user-selected project, package, and restore directories;
 - ReHome Desktop's own transaction backups and recovery records.
 
 It installs no system service, adds no autostart entry, requests no administrator rights, and uploads no data automatically. Migration does not depend on the network except when checking or downloading a GitHub Release update. Login tokens, cookies, `.env` files, private keys, `.git`, `node_modules`, virtual environments, and runtime lock files are excluded from packages by default.
+
+Restoring shared Skill content does not install Node.js, Python, Git Bash/WSL, external CLIs, credentials, or API keys. Cross-platform restores may still need Windows runtime setup for each Skill's actual dependencies.
 
 Uninstalling ReHome Desktop does not automatically remove Codex data, migration packages, restored projects, or transaction backups. The user remains in control of those files.

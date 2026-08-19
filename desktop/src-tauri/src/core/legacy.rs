@@ -295,6 +295,8 @@ pub(crate) fn inspect_schema_v3(path: &Path) -> Result<Option<VerifiedPackage>, 
             excluded_bytes: 0,
             rules: vec![exclusion_text],
         },
+        shared_skills: Vec::new(),
+        shared_skill_lock: None,
     };
     let mut entries = payloads.keys().cloned().collect::<Vec<_>>();
     entries.sort();

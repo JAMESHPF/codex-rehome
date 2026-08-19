@@ -27,6 +27,9 @@ vi.mock("./lib/updater", () => updater);
 
 const inventory = {
   codex_home: "C:\\Users\\Me\\.codex",
+  agents_skills_root: "C:\\Users\\Me\\.agents\\skills",
+  agents_skills_canonical_root: "C:\\Users\\Me\\.agents\\skills",
+  skill_lock_path: "C:\\Users\\Me\\.agents\\.skill-lock.json",
   source_os: "windows",
   source_arch: "x86_64",
   source_device_id: "11111111-1111-1111-1111-111111111111",
@@ -104,6 +107,7 @@ const inventory = {
   session_index_path: "C:\\Users\\Me\\.codex\\session_index.jsonl",
   state_db_path: "C:\\Users\\Me\\.codex\\state_5.sqlite",
   skill_paths: [],
+  shared_skill_paths: [],
   plugin_paths: [],
   generated_image_paths: [],
   skills: [
@@ -115,6 +119,41 @@ const inventory = {
       size_bytes: 2048,
       thumbnail_data_url: null,
       reveal_id: null,
+      skill_root_kind: "legacy_codex",
+      lock_status: null,
+      exclusions: { excluded_files: 0, excluded_bytes: 0, rules: [] },
+      blocked_reason: null,
+      tree_hash: null,
+    },
+  ],
+  shared_skills: [
+    {
+      content_id: "11111111-2222-4333-8444-555555555555",
+      name: "pinfei-demo",
+      source_path: "C:\\Users\\Me\\.agents\\skills\\pinfei-demo",
+      relative_path: "pinfei-demo",
+      size_bytes: 3072,
+      thumbnail_data_url: null,
+      reveal_id: null,
+      skill_root_kind: "shared_agents",
+      lock_status: "available",
+      exclusions: { excluded_files: 2, excluded_bytes: 128, rules: ["dependency data"] },
+      blocked_reason: null,
+      tree_hash: "a".repeat(64),
+    },
+    {
+      content_id: "66666666-7777-4888-8999-aaaaaaaaaaaa",
+      name: "unsafe-demo",
+      source_path: "C:\\Users\\Me\\.agents\\skills\\unsafe-demo",
+      relative_path: "unsafe-demo",
+      size_bytes: 0,
+      thumbnail_data_url: null,
+      reveal_id: null,
+      skill_root_kind: "shared_agents",
+      lock_status: "content_only",
+      exclusions: { excluded_files: 1, excluded_bytes: 64, rules: ["credential path"] },
+      blocked_reason: "sensitive credential path: .env",
+      tree_hash: null,
     },
   ],
   plugins: [
@@ -181,6 +220,8 @@ const basePlan = {
   archive_hash: preview.archive_hash,
   target_codex_home: inventory.codex_home,
   projects_root: "C:\\Restored Projects",
+  target_agents_skills_root: "C:\\Users\\Me\\.agents\\skills",
+  target_skill_lock_path: "C:\\Users\\Me\\.agents\\.skill-lock.json",
   operations: [
     {
       package_source: "projects/rehome-app/README.md",
@@ -207,6 +248,7 @@ const committedTransaction = {
     "C:\\ReHome Backups\\88888888-8888-8888-8888-888888888888",
   target_codex_home: inventory.codex_home,
   projects_root: "C:\\Restored Projects",
+  target_agents_skills_root: "C:\\Users\\Me\\.agents\\skills",
   restored_project_paths: ["C:\\Restored Projects\\rehome-app"],
   changed_files: 8,
 };
@@ -250,6 +292,10 @@ beforeEach(() => {
       project_files_valid: true,
       app_registration_valid: true,
       app_visible_ready: true,
+      shared_skill_files_valid: true,
+      codex_skill_discovery: "not_run",
+      skill_lock_merge: "skipped",
+      functional_sampling: "not_run",
     },
   });
   updater.checkForUpdates.mockResolvedValue({
@@ -296,7 +342,8 @@ describe("ReHome Desktop workflows", () => {
     const counts = screen.getByLabelText("内容数量");
     expect(counts).toHaveTextContent("2 个项目");
     expect(counts).toHaveTextContent("5 个对话");
-    expect(counts).toHaveTextContent("3 个技能");
+    expect(counts).toHaveTextContent("2 个共享技能");
+    expect(counts).toHaveTextContent("1 个旧版技能");
     expect(counts).toHaveTextContent("2 个插件");
     expect(counts).toHaveTextContent("4 张生成图片");
   });
@@ -441,6 +488,7 @@ describe("ReHome Desktop workflows", () => {
       project_ids: [],
       conversation_ids: ["44444444-4444-4444-4444-444444444444"],
       skill_ids: [],
+      shared_skill_ids: [],
       plugin_ids: [],
       generated_image_ids: [],
     });
@@ -525,8 +573,8 @@ describe("ReHome Desktop workflows", () => {
     await screen.findByText(inventory.codex_home);
     await user.click(screen.getByRole("button", { name: "前往导出" }));
 
-    await user.click(screen.getAllByRole("button", { name: /已选 0 \/ 1/ })[0]);
-    await user.click(screen.getByRole("checkbox", { name: "全选 Skills" }));
+    await user.click(screen.getAllByRole("button", { name: /已选 0 \/ 1/ })[1]);
+    await user.click(screen.getByRole("checkbox", { name: "全选 旧版 Codex Skills" }));
     expect(screen.getAllByText("imagegen").length).toBeGreaterThan(0);
 
     await user.click(screen.getByRole("button", { name: "创建迁移包" }));
@@ -534,6 +582,32 @@ describe("ReHome Desktop workflows", () => {
       project_ids: [],
       conversation_ids: [],
       skill_ids: [inventory.skills[0].content_id],
+      shared_skill_ids: [],
+      plugin_ids: [],
+      generated_image_ids: [],
+    });
+  });
+
+  it("shows shared Skill safety metadata and never selects a blocked bundle", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText(inventory.codex_home);
+    await user.click(screen.getByRole("button", { name: "前往导出" }));
+
+    await user.click(screen.getAllByRole("button", { name: /已选 0 \/ 1/ })[0]);
+    expect(screen.getByText("lock：可迁移")).toBeVisible();
+    expect(screen.getByText("已排除 2 个文件")).toBeVisible();
+    expect(screen.getByText(/已阻止：sensitive credential path/)).toBeVisible();
+    expect(screen.getByRole("checkbox", { name: "选择 unsafe-demo" })).toBeDisabled();
+
+    await user.click(screen.getByRole("checkbox", { name: "全选 共享用户 Skills" }));
+    await user.click(screen.getByRole("button", { name: "创建迁移包" }));
+
+    expect(api.createPackage).toHaveBeenCalledWith({
+      project_ids: [],
+      conversation_ids: [],
+      skill_ids: [],
+      shared_skill_ids: [inventory.shared_skills[0].content_id],
       plugin_ids: [],
       generated_image_ids: [],
     });
@@ -561,7 +635,7 @@ describe("ReHome Desktop workflows", () => {
     render(<App />);
     await screen.findByText(inventory.codex_home);
     await user.click(screen.getByRole("button", { name: "前往导出" }));
-    await user.click(screen.getAllByRole("button", { name: /已选 0 \/ 1/ })[2]);
+    await user.click(screen.getAllByRole("button", { name: /已选 0 \/ 1/ })[3]);
 
     expect(document.querySelector("img.image-thumbnail")).not.toBeNull();
     await user.click(screen.getByRole("button", { name: "在文件夹中显示 result.png" }));
@@ -612,9 +686,48 @@ describe("ReHome Desktop workflows", () => {
       preview.selection_id,
       "13131313-1313-4131-8131-131313131313",
       "keep_existing",
+      {},
     );
     expect(await screen.findByText("已选择保留新电脑上的不同文件。")).toBeVisible();
     expect(screen.getByText("冲突 0")).toBeVisible();
+  });
+
+  it("resolves shared Skill conflicts per complete bundle", async () => {
+    const user = userEvent.setup();
+    const skillOperation = {
+      package_source: "agents/skills/pinfei-demo",
+      target: "C:\\Users\\Me\\.agents\\skills\\pinfei-demo",
+      expected_previous_hash: "b".repeat(64),
+      action: "preserve",
+      rollback_required: false,
+      root_kind: "agents_skills",
+      operation_kind: "skill_bundle",
+      content_id: inventory.shared_skills[0].content_id,
+      expected_final_hash: "a".repeat(64),
+    };
+    api.buildRestorePlan
+      .mockResolvedValueOnce({ ...basePlan, operations: [basePlan.operations[0], skillOperation] })
+      .mockResolvedValueOnce({
+        ...basePlan,
+        operations: [
+          basePlan.operations[0],
+          { ...skillOperation, action: "update", rollback_required: true },
+        ],
+      });
+    render(<App />);
+    await screen.findByText(inventory.codex_home);
+    await openReceive(user);
+
+    expect(screen.getByRole("button", { name: "保留目标" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "使用迁移包" }));
+
+    expect(api.buildRestorePlan).toHaveBeenLastCalledWith(
+      preview.selection_id,
+      "13131313-1313-4131-8131-131313131313",
+      undefined,
+      { [inventory.shared_skills[0].content_id]: "use_package" },
+    );
+    expect(await screen.findByText("更新")).toBeVisible();
   });
 
   it("offers the same conflict choices in English", async () => {
@@ -778,6 +891,10 @@ describe("ReHome Desktop workflows", () => {
         project_files_valid: true,
         app_registration_valid: false,
         app_visible_ready: false,
+        shared_skill_files_valid: true,
+        codex_skill_discovery: "not_run",
+        skill_lock_merge: "skipped",
+        functional_sampling: "not_run",
       },
     });
     render(<App />);
@@ -942,6 +1059,10 @@ function restoreReportWithRegistration(status: "manual_open_required") {
       project_files_valid: true,
       app_registration_valid: false,
       app_visible_ready: false,
+      shared_skill_files_valid: true,
+      codex_skill_discovery: "not_run",
+      skill_lock_merge: "skipped",
+      functional_sampling: "not_run",
     },
   };
 }

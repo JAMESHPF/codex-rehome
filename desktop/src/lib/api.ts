@@ -45,6 +45,7 @@ export async function buildRestorePlan(
   packageSelectionId: string,
   destinationSelectionId: string,
   conflictResolution?: FileConflictResolution,
+  skillConflictResolutions: Record<string, FileConflictResolution> = {},
 ): Promise<RestorePlan> {
   const response = await invoke<{ action: "plan"; plan: RestorePlan } | null>(
     "build_restore_plan",
@@ -54,6 +55,7 @@ export async function buildRestorePlan(
         package_selection_id: packageSelectionId,
         destination_selection_id: destinationSelectionId,
         conflict_resolution: conflictResolution,
+        skill_conflict_resolutions: skillConflictResolutions,
       },
     },
   );

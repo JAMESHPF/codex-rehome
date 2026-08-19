@@ -259,6 +259,14 @@ impl PinnedParent {
         Ok(file)
     }
 
+    pub(crate) fn create_directory(&self, name: &OsStr) -> io::Result<()> {
+        validate_name(name)?;
+        self.verify_location()?;
+        create_directory_at(self, name)?;
+        self.verify_location()?;
+        sync_directory_handle(&self.directory)
+    }
+
     pub(crate) fn open_file_for_write(&self, name: &OsStr) -> io::Result<fs::File> {
         validate_name(name)?;
         self.verify_location()?;
@@ -314,6 +322,24 @@ impl PinnedParent {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn create_directory_at(parent: &PinnedParent, name: &OsStr) -> io::Result<()> {
+    use std::{ffi::CString, os::fd::AsRawFd, os::unix::ffi::OsStrExt};
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "directory name contains NUL"))?;
+    let result = unsafe { libc::mkdirat(parent.directory.as_raw_fd(), name.as_ptr(), 0o700) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn create_directory_at(parent: &PinnedParent, name: &OsStr) -> io::Result<()> {
+    fs::create_dir(parent.path.join(name))
 }
 
 fn io_stage(stage: &str, error: io::Error) -> io::Error {

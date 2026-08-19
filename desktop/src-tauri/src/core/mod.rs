@@ -11,4 +11,5 @@ pub(crate) mod plan_store;
 pub mod planner;
 pub mod restore;
 pub(crate) mod session;
+pub(crate) mod shared_skills;
 pub(crate) mod stable_fs;

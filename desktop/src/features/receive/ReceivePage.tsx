@@ -31,6 +31,7 @@ import {
   type RestoreLocationSelection,
   type RestorePlan,
   type RestoreReport,
+  type VerificationStatus,
 } from "../../lib/types";
 
 interface ReceivePageProps {
@@ -40,7 +41,11 @@ interface ReceivePageProps {
   onOperationEnd: () => void;
 }
 
-const verificationLabels: Array<[keyof RestoreReport["verification"], string]> = [
+type BooleanVerificationKey = {
+  [K in keyof RestoreReport["verification"]]: RestoreReport["verification"][K] extends boolean ? K : never;
+}[keyof RestoreReport["verification"]];
+
+const verificationLabels: Array<[BooleanVerificationKey, string]> = [
   ["package_checksum_valid", "迁移包校验"],
   ["files_valid", "文件完整性"],
   ["sessions_valid", "对话文件"],
@@ -51,6 +56,16 @@ const verificationLabels: Array<[keyof RestoreReport["verification"], string]> =
   ["project_files_valid", "项目文件"],
   ["app_registration_valid", "Codex 项目登记"],
   ["app_visible_ready", "Codex 可见状态"],
+  ["shared_skill_files_valid", "共享 Skills 完整性"],
+];
+
+const statusVerificationLabels: Array<[
+  "codex_skill_discovery" | "skill_lock_merge" | "functional_sampling",
+  string,
+]> = [
+  ["codex_skill_discovery", "Codex Skills 发现"],
+  ["skill_lock_merge", "Skills lock 合并"],
+  ["functional_sampling", "Skill 功能抽样"],
 ];
 
 export default function ReceivePage({
@@ -64,6 +79,7 @@ export default function ReceivePage({
   const [locations, setLocations] = useState<RestoreLocationSelection | null>(null);
   const [plan, setPlan] = useState<RestorePlan | null>(null);
   const [conflictResolution, setConflictResolution] = useState<FileConflictResolution | null>(null);
+  const [skillConflictResolutions, setSkillConflictResolutions] = useState<Record<string, FileConflictResolution>>({});
   const [codexClosed, setCodexClosed] = useState(false);
   const [report, setReport] = useState<RestoreReport | null>(null);
   const [phase, setPhase] = useState<"idle" | "inspecting" | "selecting" | "planning" | "restoring">("idle");
@@ -117,7 +133,10 @@ export default function ReceivePage({
     }
   }
 
-  async function handlePlan(resolution: FileConflictResolution | null = null) {
+  async function handlePlan(
+    resolution: FileConflictResolution | null = conflictResolution,
+    nextSkillResolutions: Record<string, FileConflictResolution> = skillConflictResolutions,
+  ) {
     if (!preview || !locations || phase !== "idle") return;
     const generation = ++requestGeneration.current;
     setError(null);
@@ -129,10 +148,12 @@ export default function ReceivePage({
         preview.selection_id,
         locations.selection_id,
         resolution ?? undefined,
+        nextSkillResolutions,
       );
       if (generation === requestGeneration.current) {
         setPlan(nextPlan);
         setConflictResolution(resolution);
+        setSkillConflictResolutions(nextSkillResolutions);
       }
     } catch (caught) {
       if (generation !== requestGeneration.current) return;
@@ -147,9 +168,15 @@ export default function ReceivePage({
   function clearRestoreSelection() {
     setPlan(null);
     setConflictResolution(null);
+    setSkillConflictResolutions({});
     setReport(null);
     setCodexClosed(false);
     setRegistrationStatuses({});
+  }
+
+  async function resolveSkillConflict(contentId: string, resolution: FileConflictResolution) {
+    const next = { ...skillConflictResolutions, [contentId]: resolution };
+    await handlePlan(conflictResolution, next);
   }
 
   async function handleRestore() {
@@ -233,10 +260,32 @@ export default function ReceivePage({
         <section className="workflow-section" aria-labelledby="restore-plan-title">
           <div className="section-title-row"><div><span className="step-number">3</span><h2 id="restore-plan-title">{t("确认导入内容")}</h2></div><div className="plan-badges"><span>{t("需要 {size}", { size: formatBytes(plan.required_bytes) })}</span><span className={plan.conflict_count ? "status status-error" : "status status-success"}>{plan.conflict_count ? <AlertTriangle aria-hidden="true" /> : <CheckCircle2 aria-hidden="true" />}{t("冲突 {count}", { count: plan.conflict_count })}</span></div></div>
           <div className="destination-line"><span>{t("目标项目目录")}</span><code>{plan.projects_root}</code></div>
+          {(preview?.manifest.shared_skills?.length ?? 0) > 0 && (
+            <>
+              <div className="destination-line"><span>{t("共享 Skills 目录")}</span><code>{plan.target_agents_skills_root}</code></div>
+              <div className="destination-line"><span>{t("Skills lock")}</span><code>{plan.target_skill_lock_path}</code></div>
+            </>
+          )}
           <div className="table-wrap">
             <table className="conflict-table">
               <thead><tr><th>{t("包内来源")}</th><th>{t("目标位置")}</th><th>{t("变更")}</th></tr></thead>
-              <tbody>{plan.operations.map((operation) => <tr key={`${operation.package_source}-${operation.target}`}><td><code>{operation.package_source}</code></td><td><code>{operation.target}</code></td><td><span className={`change change-${operation.action}`}>{changeLabel(operation.action, t)}</span></td></tr>)}</tbody>
+              <tbody>{plan.operations.map((operation) => (
+                <tr key={`${operation.package_source}-${operation.target}`}>
+                  <td><code>{operation.package_source}</code></td>
+                  <td><code>{operation.target}</code></td>
+                  <td>
+                    <span className={`change change-${operation.action}`}>{changeLabel(operation.action, t)}</span>
+                    {operation.operation_kind === "skill_bundle" && operation.content_id && operation.expected_previous_hash && operation.action !== "unchanged" && (
+                      <SkillBundleChoice
+                        name={operation.package_source.split("/").at(-1) ?? operation.package_source}
+                        resolution={skillConflictResolutions[operation.content_id] ?? "keep_existing"}
+                        busy={phase === "planning"}
+                        onResolve={(resolution) => resolveSkillConflict(operation.content_id!, resolution)}
+                      />
+                    )}
+                  </td>
+                </tr>
+              ))}</tbody>
             </table>
           </div>
           {plan.conflict_count > 0 && (
@@ -270,6 +319,12 @@ export default function ReceivePage({
               const passed = report.verification[key];
               return <span key={key} className={passed ? "verification-pass" : "verification-fail"}>{passed ? <CheckCircle2 aria-hidden="true" /> : <AlertTriangle aria-hidden="true" />}{t(label)}</span>;
             })}
+            {statusVerificationLabels.map(([key, label]) => {
+              const status = report.verification[key];
+              const passed = status === "passed";
+              const failed = status === "failed";
+              return <span key={key} className={passed ? "verification-pass" : failed ? "verification-fail" : "verification-pending"}>{passed ? <CheckCircle2 aria-hidden="true" /> : failed ? <AlertTriangle aria-hidden="true" /> : <Circle aria-hidden="true" />}{t(label)} · {verificationStatusLabel(status, t)}</span>;
+            })}
           </div>
           {manualRegistration && <p className="manual-status" role="status"><AlertTriangle aria-hidden="true" />{t("项目文件已导入，需要在 Codex 中手动打开")}</p>}
           {report.registrations.map((registration) => (
@@ -283,6 +338,26 @@ export default function ReceivePage({
 
 function PathPicker({ icon: Icon, label, value, buttonLabel, onClick, disabled }: { icon: typeof FolderOpen; label: string; value: string; buttonLabel?: string; onClick?: () => Promise<void>; disabled?: boolean }) {
   return <div className="form-row"><div className="form-label"><Icon aria-hidden="true" /><span><strong>{label}</strong><small>{value}</small></span></div>{buttonLabel && onClick && <button className="secondary-button" type="button" disabled={disabled} onClick={() => void onClick()}><FolderOpen aria-hidden="true" />{buttonLabel}</button>}</div>;
+}
+
+function SkillBundleChoice({
+  name,
+  resolution,
+  busy,
+  onResolve,
+}: {
+  name: string;
+  resolution: FileConflictResolution;
+  busy: boolean;
+  onResolve: (resolution: FileConflictResolution) => Promise<void>;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="skill-bundle-choice" role="group" aria-label={t("{name} 的整包冲突处理", { name })}>
+      <button type="button" aria-pressed={resolution === "keep_existing"} disabled={busy || resolution === "keep_existing"} onClick={() => void onResolve("keep_existing")}>{t("保留目标")}</button>
+      <button type="button" aria-pressed={resolution === "use_package"} disabled={busy || resolution === "use_package"} onClick={() => void onResolve("use_package")}>{t("使用迁移包")}</button>
+    </div>
+  );
 }
 
 function ConflictResolutionPanel({
@@ -348,6 +423,10 @@ function sourceOsLabel(os: "windows" | "macos"): string {
 
 function changeLabel(change: RestorePlan["operations"][number]["action"], t: (key: string) => string): string {
   return t({ add: "新增", update: "更新", unchanged: "不变", preserve: "保留本机", conflict: "冲突" }[change]);
+}
+
+function verificationStatusLabel(status: VerificationStatus, t: (key: string) => string): string {
+  return t({ passed: "通过", failed: "失败", skipped: "已跳过", not_run: "尚未执行" }[status]);
 }
 
 function formatBytes(bytes: number): string {

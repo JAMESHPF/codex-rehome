@@ -79,10 +79,13 @@ export default function HomePage({
         {inventory && (
           <>
             <div className="path-line"><span>Codex Home</span><code>{inventory.codex_home}</code></div>
+            {inventory.agents_skills_root && <div className="path-line"><span>Shared Skills</span><code>{inventory.agents_skills_root}</code></div>}
+            {inventory.skill_lock_path && <div className="path-line"><span>Skills lock</span><code>{inventory.skill_lock_path}</code></div>}
             <div className="count-grid" aria-label={t("内容数量")}>
               <span><FolderKanban aria-hidden="true" /><strong>{inventory.counts.projects}</strong> {t("{count} 个项目", { count: "" }).trim()}</span>
               <span><MessageSquareText aria-hidden="true" /><strong>{inventory.counts.conversations}</strong> {t("{count} 个对话", { count: "" }).trim()}</span>
-              <span><Sparkles aria-hidden="true" /><strong>{inventory.counts.skills}</strong> {t("{count} 个技能", { count: "" }).trim()}</span>
+              <span><Sparkles aria-hidden="true" /><strong>{inventory.shared_skills.length}</strong> {t("{count} 个共享技能", { count: "" }).trim()}</span>
+              <span><Sparkles aria-hidden="true" /><strong>{inventory.skills.length}</strong> {t("{count} 个旧版技能", { count: "" }).trim()}</span>
               <span><Puzzle aria-hidden="true" /><strong>{inventory.counts.plugins}</strong> {t("{count} 个插件", { count: "" }).trim()}</span>
               <span><Image aria-hidden="true" /><strong>{inventory.counts.generated_images}</strong> {t("{count} 张生成图片", { count: "" }).trim()}</span>
             </div>

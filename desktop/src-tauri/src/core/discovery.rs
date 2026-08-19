@@ -2,10 +2,15 @@ use crate::core::{
     error::{ErrorCode, RehomeError},
     models::{
         CodexInventory, ContentCounts, ConversationClassification, ConversationEntry,
-        OptionalContentEntry, ProjectEntry, SourceOs,
+        ExclusionSummary, OptionalContentEntry, ProjectEntry, SkillLockStatus, SkillRootKind,
+        SourceOs,
     },
     paths::normalize_entry,
     session::{metadata_string, metadata_uuid, parse_session_metadata, SessionMetadata},
+    shared_skills::{
+        discover_shared_skills, resolve_agents_skills_root, resolve_skill_lock_path,
+        SharedSkillsContext,
+    },
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rusqlite::{backup::Backup, Connection, OpenFlags};
@@ -65,12 +70,27 @@ pub fn resolve_codex_home_for_os(
 }
 
 pub fn discover_codex(override_home: Option<PathBuf>) -> Result<CodexInventory, RehomeError> {
-    discover_codex_with_context(override_home, &DiscoveryContext::from_process_environment())
+    let context = DiscoveryContext::from_process_environment();
+    let shared_context = SharedSkillsContext::from_process_environment();
+    discover_codex_with_contexts(override_home, &context, &shared_context)
 }
 
 pub fn discover_codex_with_context(
     override_home: Option<PathBuf>,
     context: &DiscoveryContext,
+) -> Result<CodexInventory, RehomeError> {
+    let shared_context = SharedSkillsContext {
+        user_profile: context.user_profile.clone(),
+        home: context.home.clone(),
+        xdg_state_home: None,
+    };
+    discover_codex_with_contexts(override_home, context, &shared_context)
+}
+
+pub fn discover_codex_with_contexts(
+    override_home: Option<PathBuf>,
+    context: &DiscoveryContext,
+    shared_context: &SharedSkillsContext,
 ) -> Result<CodexInventory, RehomeError> {
     let codex_home = resolve_codex_home(override_home, context)?;
     let codex_home_is_real_directory = fs::symlink_metadata(&codex_home)
@@ -83,7 +103,30 @@ pub fn discover_codex_with_context(
         ));
     }
 
+    let source_os = current_source_os();
     let mut warnings = Vec::new();
+    let agents_skills_root = resolve_agents_skills_root(shared_context, source_os);
+    let skill_lock_path = resolve_skill_lock_path(shared_context, source_os);
+    let mut agents_skills_canonical_root = None;
+    let mut shared_skills = Vec::new();
+    let mut shared_skill_paths = Vec::new();
+    if let (Some(root), Some(lock)) = (agents_skills_root.clone(), skill_lock_path.clone()) {
+        match discover_shared_skills(root, lock) {
+            Ok(shared) => {
+                agents_skills_canonical_root = shared.canonical_root;
+                shared_skill_paths = shared.bundle_paths;
+                shared_skills = shared.entries;
+                warnings.extend(shared.warnings);
+            }
+            Err(error) => warnings.push(format!(
+                "Could not discover shared user Skills: {}",
+                error.message
+            )),
+        }
+    } else {
+        warnings
+            .push("Shared user Skills root could not be resolved from the user home".to_owned());
+    }
     let mut conversation_paths = collect_files(
         &codex_home.join("sessions"),
         |path| extension_is(path, "jsonl"),
@@ -159,7 +202,28 @@ pub fn discover_codex_with_context(
 
     dedupe_warnings(&mut warnings);
 
-    let skills = optional_tree_entries(&skill_paths, &codex_home.join("skills"), "skill", false);
+    let mut skills = optional_tree_entries(
+        &skill_paths,
+        &codex_home.join("skills"),
+        "legacy-codex-skill",
+        false,
+    );
+    skills.retain(|entry| {
+        entry.relative_path != ".system" && !entry.relative_path.starts_with(".system/")
+    });
+    for entry in &mut skills {
+        entry.skill_root_kind = Some(SkillRootKind::LegacyCodex);
+        entry.lock_status = Some(SkillLockStatus::NotApplicable);
+    }
+    inspect_legacy_skill_links(
+        &codex_home.join("skills"),
+        agents_skills_canonical_root.as_deref(),
+        &mut warnings,
+    );
+    let skill_paths = skills
+        .iter()
+        .map(|entry| entry.source_path.clone())
+        .collect();
     let plugins = optional_tree_entries(
         &plugin_paths,
         &codex_home.join("plugins").join("cache"),
@@ -174,14 +238,17 @@ pub fn discover_codex_with_context(
 
     Ok(CodexInventory {
         codex_home,
-        source_os: current_source_os(),
+        agents_skills_root,
+        agents_skills_canonical_root,
+        skill_lock_path,
+        source_os,
         source_arch: env::consts::ARCH.to_owned(),
         source_device_id: Uuid::nil(),
         counts: ContentCounts {
             projects: projects.len() as u64,
             project_files: 0,
             conversations: conversations.len() as u64,
-            skills: skills.len() as u64,
+            skills: (skills.len() + shared_skills.len()) as u64,
             plugins: plugins.len() as u64,
             generated_images: generated_images.len() as u64,
             sqlite_threads,
@@ -193,9 +260,11 @@ pub fn discover_codex_with_context(
         session_index_path,
         state_db_path,
         skill_paths,
+        shared_skill_paths,
         plugin_paths,
         generated_image_paths,
         skills,
+        shared_skills,
         plugins,
         generated_images,
         warnings,
@@ -880,6 +949,11 @@ fn optional_tree_entries(
                 size_bytes: directory_size(&bundle),
                 thumbnail_data_url: None,
                 reveal_id: None,
+                skill_root_kind: None,
+                lock_status: None,
+                exclusions: ExclusionSummary::default(),
+                blocked_reason: None,
+                tree_hash: None,
             })
         })
         .collect::<Vec<_>>();
@@ -925,11 +999,60 @@ fn optional_file_entries(paths: &[PathBuf], root: &Path, kind: &str) -> Vec<Opti
                 size_bytes: path.metadata().map(|metadata| metadata.len()).unwrap_or(0),
                 thumbnail_data_url: image_thumbnail(path),
                 reveal_id: None,
+                skill_root_kind: None,
+                lock_status: None,
+                exclusions: ExclusionSummary::default(),
+                blocked_reason: None,
+                tree_hash: None,
             })
         })
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     entries
+}
+
+fn inspect_legacy_skill_links(
+    legacy_root: &Path,
+    shared_canonical_root: Option<&Path>,
+    warnings: &mut Vec<String>,
+) {
+    let entries = match fs::read_dir(legacy_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(_) => {
+            push_warning_unique(
+                warnings,
+                "Could not inspect legacy Codex Skill aliases".to_owned(),
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+        match fs::canonicalize(&path) {
+            Ok(target) if shared_canonical_root.is_some_and(|root| target.starts_with(root)) => {
+                // Compatibility alias for a shared user Skill. The shared root is
+                // authoritative and is already represented once in the inventory.
+            }
+            Ok(_) => push_warning_unique(
+                warnings,
+                format!(
+                    "Skipped legacy Codex Skill link outside the shared Skills root: {}",
+                    path.display()
+                ),
+            ),
+            Err(_) => push_warning_unique(
+                warnings,
+                format!("Broken legacy Codex Skill link: {}", path.display()),
+            ),
+        }
+    }
 }
 
 fn image_thumbnail(path: &Path) -> Option<String> {

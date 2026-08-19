@@ -1,6 +1,13 @@
+#[allow(dead_code)]
+mod common;
+
+use common::{test_agents_skills_root, test_skill_lock_path};
 use rehome_desktop_lib::core::{
     discovery::discover_codex,
-    models::{ContentCounts, CreatePackageRequest, RestoreOptions, SourceOs, TargetInventory},
+    models::{
+        ContentCounts, CreatePackageRequest, RestoreOptions, SkillLockStatus, SourceOs,
+        TargetInventory,
+    },
     package::{create_package, inspect_package},
     planner::build_restore_plan,
     restore::apply_restore,
@@ -46,6 +53,7 @@ fn local_all_optional_content_package() -> Result<(), Box<dyn Error>> {
         output_path: sandbox.path().join("all-optional-content.rehome"),
         source_device_id: inventory.source_device_id,
         skill_paths,
+        shared_skill_paths: vec![],
         plugin_paths,
         generated_image_paths,
     })?;
@@ -58,6 +66,69 @@ fn local_all_optional_content_package() -> Result<(), Box<dyn Error>> {
         report.counts.skills,
         report.counts.plugins,
         report.counts.generated_images,
+        report.bytes_written,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "reads the local shared Skills profile and creates a private temporary package"]
+fn local_shared_skills_package_preflight() -> Result<(), Box<dyn Error>> {
+    let inventory = discover_codex(None)?;
+    let total = inventory.shared_skills.len();
+    let blocked = inventory
+        .shared_skills
+        .iter()
+        .filter(|entry| entry.blocked_reason.is_some())
+        .count();
+    let selected = inventory
+        .shared_skills
+        .iter()
+        .filter(|entry| entry.blocked_reason.is_none())
+        .collect::<Vec<_>>();
+    let content_only = selected
+        .iter()
+        .filter(|entry| entry.lock_status != Some(SkillLockStatus::Available))
+        .count();
+    if selected.is_empty() {
+        return Err("no selectable shared user Skills were discovered".into());
+    }
+
+    let sandbox = tempdir()?;
+    let report = create_package(CreatePackageRequest {
+        codex_home: inventory.codex_home,
+        project_paths: vec![],
+        conversation_ids: vec![],
+        output_path: sandbox.path().join("private-shared-skills.rehome"),
+        source_device_id: inventory.source_device_id,
+        skill_paths: vec![],
+        shared_skill_paths: selected
+            .iter()
+            .map(|entry| entry.source_path.clone())
+            .collect(),
+        plugin_paths: vec![],
+        generated_image_paths: vec![],
+    })?;
+    let package = inspect_package(&report.package_path)?;
+    assert!(package.checksum_valid);
+    assert_eq!(package.forbidden_files_total, 0);
+    assert_eq!(package.manifest.schema_version, 2);
+    assert_eq!(package.manifest.shared_skills.len(), selected.len());
+    let lock = package
+        .manifest
+        .shared_skill_lock
+        .as_ref()
+        .ok_or("source v3 Skill lock was not packaged")?;
+    assert_eq!(lock.content_only_count, content_only as u64);
+    assert_eq!(
+        lock.entry_count + lock.content_only_count,
+        selected.len() as u64
+    );
+
+    println!(
+        "Shared-Skills preflight passed: {total} discovered, {} selectable, {blocked} blocked, {} v3 lock entries, {content_only} content-only, {} packaged bytes.",
+        selected.len(),
+        lock.entry_count,
         report.bytes_written,
     );
     Ok(())
@@ -90,6 +161,7 @@ fn local_windows_to_windows_acceptance() -> Result<(), Box<dyn Error>> {
         output_path: package_path.clone(),
         source_device_id: Uuid::new_v4(),
         skill_paths: vec![],
+        shared_skill_paths: vec![],
         plugin_paths: vec![],
         generated_image_paths: vec![],
     })?;
@@ -112,6 +184,8 @@ fn local_windows_to_windows_acceptance() -> Result<(), Box<dyn Error>> {
 
     let target = TargetInventory {
         codex_home: target_codex_home.clone(),
+        agents_skills_root: test_agents_skills_root(SourceOs::Windows),
+        skill_lock_path: test_skill_lock_path(SourceOs::Windows),
         target_os: SourceOs::Windows,
         target_arch: env::consts::ARCH.into(),
         counts: ContentCounts::default(),

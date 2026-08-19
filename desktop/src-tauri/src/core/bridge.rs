@@ -504,6 +504,10 @@ pub fn import_sqlite_threads(
         expected_previous_hash: Some(hash_file(database)?),
         action: ChangeKind::Update,
         rollback_required: true,
+        root_kind: crate::core::models::RestoreRootKind::CodexHome,
+        operation_kind: crate::core::models::OperationKind::File,
+        content_id: None,
+        expected_final_hash: None,
     };
     import_sqlite_threads_for_operation(parent, &operation, package_bytes, sessions, rewrites, None)
 }

@@ -35,19 +35,23 @@ ReHome Desktop 是 Codex Rehome 的离线桌面版。它把 ReHome Core 和 Code
 
 ## 使用方式
 
-- 旧电脑：选择“发送”，选择要迁移的项目和对话，生成 `.rehome` 文件。
+- 旧电脑：选择“发送”，选择要迁移的项目、对话和共享用户 Skills，生成 `.rehome` 文件。
 - 用移动硬盘、局域网、网盘或私人聊天工具把该文件传到新电脑。
 - 新电脑：先安装并登录一次 Codex，然后完全退出 Codex；再选择“接收”，检查恢复计划并确认执行。
 - 恢复默认采用合并方式。应用会备份目标状态、映射 Windows/macOS 路径、合并对话索引，并通过 Codex 官方项目入口注册恢复的项目。
+- 同名共享 Skill 默认保留新电脑版本；选择“使用迁移包”时会整目录替换并保留可回滚备份，不会逐文件混合。损坏或未知版本的目标 Skill lock 不会被覆盖。
 
 ## 对系统的影响
 
 ReHome Desktop 只在用户确认后读取或写入以下位置：
 
 - 当前用户的 Codex 数据目录，例如 `~/.codex`
+- 当前用户的共享 Skills 目录与 v3 lock，例如 `~/.agents/skills` 和 `~/.agents/.skill-lock.json`
 - 用户选择的项目目录、迁移包和项目恢复目录
 - ReHome Desktop 自己的事务备份与恢复记录
 
 它不安装系统服务，不设置开机启动，不请求管理员权限，也不会自动上传数据。除检查和下载 GitHub Release 更新外，迁移过程不依赖网络。登录令牌、Cookies、`.env`、私钥、`.git`、`node_modules`、虚拟环境和运行时锁文件默认不会进入迁移包。
+
+共享 Skill 的内容恢复不包含 Node.js、Python、Git Bash/WSL、外部 CLI、凭据或 API Key。跨系统恢复后仍需按 Skill 的实际依赖配置 Windows 运行环境。
 
 卸载 ReHome Desktop 不会自动删除 Codex 数据、迁移包、已恢复项目或事务备份；这些仍由用户自行保留或删除。

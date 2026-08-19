@@ -1,3 +1,7 @@
+#[allow(dead_code)]
+mod common;
+
+use common::{test_agents_skills_root, test_skill_lock_path};
 use rehome_desktop_lib::core::{
     models::{ContentCounts, SourceOs, TargetInventory},
     package::inspect_package,
@@ -85,6 +89,16 @@ fn schema_v3_payloads_enter_the_normal_restore_plan() -> Result<(), Box<dyn Erro
     drop(database);
     let target = TargetInventory {
         codex_home,
+        agents_skills_root: test_agents_skills_root(if cfg!(target_os = "macos") {
+            SourceOs::Macos
+        } else {
+            SourceOs::Windows
+        }),
+        skill_lock_path: test_skill_lock_path(if cfg!(target_os = "macos") {
+            SourceOs::Macos
+        } else {
+            SourceOs::Windows
+        }),
         target_os: if cfg!(target_os = "macos") {
             SourceOs::Macos
         } else {

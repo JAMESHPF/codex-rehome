@@ -13,7 +13,7 @@ use crate::core::{
         create_package_replacing as core_create_package_replacing,
         inspect_package as core_inspect_package,
     },
-    planner::build_restore_plan_with_conflict_resolution as core_build_restore_plan,
+    planner::build_restore_plan_with_skill_resolutions as core_build_restore_plan,
     restore::{
         apply_restore_by_id, list_transaction_history as core_list_transaction_history,
         rollback as core_rollback, transaction_summary as core_transaction_summary,
@@ -21,7 +21,7 @@ use crate::core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Component, Path, PathBuf, Prefix},
     process::Command,
@@ -41,6 +41,8 @@ pub struct CreatePackageSelection {
     pub project_ids: Vec<Uuid>,
     pub conversation_ids: Vec<Uuid>,
     pub skill_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub shared_skill_ids: Vec<Uuid>,
     pub plugin_ids: Vec<Uuid>,
     pub generated_image_ids: Vec<Uuid>,
 }
@@ -70,6 +72,8 @@ pub enum BuildRestorePlanRequest {
         package_selection_id: Uuid,
         destination_selection_id: Uuid,
         conflict_resolution: Option<FileConflictResolution>,
+        #[serde(default)]
+        skill_conflict_resolutions: BTreeMap<Uuid, FileConflictResolution>,
     },
 }
 
@@ -83,7 +87,7 @@ pub enum BuildRestorePlanResponse {
         backup_root: PathBuf,
     },
     Plan {
-        plan: RestorePlan,
+        plan: Box<RestorePlan>,
     },
 }
 
@@ -562,6 +566,7 @@ pub async fn build_restore_plan(
             package_selection_id,
             destination_selection_id,
             conflict_resolution,
+            skill_conflict_resolutions,
         } => {
             let package_path = state.resolve_package(package_selection_id)?;
             let (projects_root, backup_root) =
@@ -571,16 +576,35 @@ pub async fn build_restore_plan(
             let inventory = core_discover_codex(None)?;
             let target = TargetInventory {
                 codex_home: inventory.codex_home,
+                agents_skills_root: inventory.agents_skills_root.ok_or_else(|| {
+                    selection_failed(
+                        ErrorCode::CodexNotFound,
+                        "target shared Skills root could not be resolved",
+                    )
+                })?,
+                skill_lock_path: inventory.skill_lock_path.ok_or_else(|| {
+                    selection_failed(
+                        ErrorCode::CodexNotFound,
+                        "target shared Skills lock path could not be resolved",
+                    )
+                })?,
                 target_os: inventory.source_os,
                 target_arch: inventory.source_arch,
                 counts: inventory.counts,
                 projects: inventory.projects,
                 conversations: inventory.conversations,
             };
-            let plan =
-                core_build_restore_plan(&package, &target, &projects_root, conflict_resolution)?;
+            let plan = core_build_restore_plan(
+                &package,
+                &target,
+                &projects_root,
+                conflict_resolution,
+                &skill_conflict_resolutions,
+            )?;
             state.grant_plan(plan.plan_id, backup_root)?;
-            Ok(Some(BuildRestorePlanResponse::Plan { plan }))
+            Ok(Some(BuildRestorePlanResponse::Plan {
+                plan: Box::new(plan),
+            }))
         }
     })
     .await
@@ -748,6 +772,11 @@ pub(crate) fn resolve_create_package_request(
         output_path,
         source_device_id: inventory.source_device_id,
         skill_paths: resolve_optional_paths(&selection.skill_ids, &inventory.skills, "skill")?,
+        shared_skill_paths: resolve_selectable_optional_paths(
+            &selection.shared_skill_ids,
+            &inventory.shared_skills,
+            "shared skill",
+        )?,
         plugin_paths: resolve_optional_paths(&selection.plugin_ids, &inventory.plugins, "plugin")?,
         generated_image_paths: resolve_optional_paths(
             &selection.generated_image_ids,
@@ -755,6 +784,25 @@ pub(crate) fn resolve_create_package_request(
             "generated image",
         )?,
     })
+}
+
+fn resolve_selectable_optional_paths(
+    selected_ids: &[Uuid],
+    entries: &[crate::core::models::OptionalContentEntry],
+    kind: &str,
+) -> Result<Vec<PathBuf>, RehomeError> {
+    let selected = resolve_optional_paths(selected_ids, entries, kind)?;
+    for id in selected_ids {
+        if let Some(entry) = entries.iter().find(|entry| entry.content_id == *id) {
+            if let Some(reason) = entry.blocked_reason.as_deref() {
+                return Err(selection_failed(
+                    ErrorCode::PackageInvalid,
+                    format!("selected {kind} {} is blocked: {reason}", entry.name),
+                ));
+            }
+        }
+    }
+    Ok(selected)
 }
 
 fn resolve_optional_paths(
