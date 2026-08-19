@@ -1267,7 +1267,7 @@ mod fault_injection_tests {
             };
             let mut injected = false;
             let crashed = catch_unwind(AssertUnwindSafe(|| {
-                let _ = apply_server_plan_with_fault(
+                apply_server_plan_with_fault(
                     plan,
                     options,
                     |_, _| RegistrationStatus::ManualOpenRequired,
@@ -1278,7 +1278,8 @@ mod fault_injection_tests {
                         }
                         Ok(())
                     },
-                );
+                )
+                .unwrap();
             }));
             assert!(injected, "fault point {point:?} was not reached");
             assert!(crashed.is_err(), "fault point {point:?} did not crash");
