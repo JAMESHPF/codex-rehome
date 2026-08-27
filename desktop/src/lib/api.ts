@@ -6,6 +6,7 @@ import type {
   CreatePackageRequest,
   FileConflictResolution,
   PackagePreview,
+  ProjectFileScanResult,
   RegistrationStatus,
   RestoreOptions,
   RestoreLocationSelection,
@@ -18,6 +19,10 @@ import type {
 
 export function discoverCodex(): Promise<CodexInventory> {
   return invoke("discover_codex");
+}
+
+export function scanProjectFiles(projectIds: string[]): Promise<ProjectFileScanResult[]> {
+  return invoke("scan_project_files", { request: { project_ids: projectIds } });
 }
 
 export function createPackage(selection: CreatePackageRequest): Promise<CreatePackageReport | null> {

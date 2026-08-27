@@ -5,8 +5,8 @@ use crate::core::{
     error::{ErrorCode, RehomeError},
     models::{
         CodexInventory, CreatePackageReport, CreatePackageRequest, FileConflictResolution,
-        PackagePreview, RecoveryStatus, RegistrationStatus, RestoreOptions, RestorePlan,
-        RestoreReport, RollbackReport, SourceOs, TargetInventory, TransactionHistory,
+        PackagePreview, ProjectFileScanResult, RecoveryStatus, RegistrationStatus, RestoreOptions,
+        RestorePlan, RestoreReport, RollbackReport, SourceOs, TargetInventory, TransactionHistory,
         TransactionSummary,
     },
     package::{
@@ -14,6 +14,7 @@ use crate::core::{
         inspect_package as core_inspect_package,
     },
     planner::build_restore_plan_with_skill_resolutions as core_build_restore_plan,
+    project_scan::count_project_files,
     restore::{
         apply_restore_by_id, list_transaction_history as core_list_transaction_history,
         rollback as core_rollback, transaction_summary as core_transaction_summary,
@@ -45,6 +46,12 @@ pub struct CreatePackageSelection {
     pub shared_skill_ids: Vec<Uuid>,
     pub plugin_ids: Vec<Uuid>,
     pub generated_image_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanProjectFilesRequest {
+    pub project_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -453,6 +460,17 @@ pub async fn discover_codex(
 }
 
 #[tauri::command]
+pub async fn scan_project_files(
+    request: ScanProjectFilesRequest,
+) -> Result<Vec<ProjectFileScanResult>, RehomeError> {
+    run_blocking(ErrorCode::CodexNotFound, move || {
+        let inventory = core_discover_codex(None)?;
+        scan_requested_projects(&inventory, &request.project_ids)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn create_package(
     app: AppHandle,
     window: WebviewWindow,
@@ -784,6 +802,52 @@ pub(crate) fn resolve_create_package_request(
             "generated image",
         )?,
     })
+}
+
+pub(crate) fn scan_requested_projects(
+    inventory: &CodexInventory,
+    project_ids: &[Uuid],
+) -> Result<Vec<ProjectFileScanResult>, RehomeError> {
+    let unique_ids = project_ids.iter().copied().collect::<HashSet<_>>();
+    if unique_ids.len() != project_ids.len() {
+        return Err(selection_failed(
+            ErrorCode::ProjectConflict,
+            "project scan contains duplicate IDs",
+        ));
+    }
+
+    let projects_by_id = inventory
+        .projects
+        .iter()
+        .map(|project| (project.project_id, project))
+        .collect::<HashMap<_, _>>();
+    Ok(project_ids
+        .iter()
+        .map(|project_id| {
+            let Some(project) = projects_by_id.get(project_id) else {
+                return ProjectFileScanResult::Failed {
+                    project_id: *project_id,
+                    message: "project is not in fresh discovery".into(),
+                };
+            };
+            if !project.source_available {
+                return ProjectFileScanResult::Failed {
+                    project_id: *project_id,
+                    message: "project files are missing".into(),
+                };
+            }
+            match count_project_files(Path::new(&project.source_path)) {
+                Ok(file_count) => ProjectFileScanResult::Counted {
+                    project_id: *project_id,
+                    file_count,
+                },
+                Err(error) => ProjectFileScanResult::Failed {
+                    project_id: *project_id,
+                    message: error.message,
+                },
+            }
+        })
+        .collect())
 }
 
 fn resolve_selectable_optional_paths(

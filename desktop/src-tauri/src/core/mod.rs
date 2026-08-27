@@ -9,6 +9,7 @@ pub mod package;
 pub mod paths;
 pub(crate) mod plan_store;
 pub mod planner;
+pub mod project_scan;
 pub mod restore;
 pub(crate) mod session;
 pub(crate) mod shared_skills;

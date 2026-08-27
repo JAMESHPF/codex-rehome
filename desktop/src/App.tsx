@@ -16,9 +16,13 @@ import HistoryPage from "./features/history/HistoryPage";
 import ReceivePage from "./features/receive/ReceivePage";
 import SendPage from "./features/send/SendPage";
 import UpdateControl from "./features/update/UpdateControl";
-import { discoverCodex } from "./lib/api";
+import { discoverCodex, scanProjectFiles } from "./lib/api";
 import { I18nProvider, useI18n } from "./lib/i18n";
-import { errorMessage, type CodexInventory } from "./lib/types";
+import {
+  errorMessage,
+  type CodexInventory,
+  type ProjectFileScanState,
+} from "./lib/types";
 import "./App.css";
 
 export type View = "home" | "send" | "receive" | "history";
@@ -50,6 +54,7 @@ function AppContent() {
   const { locale, setLocale, t } = useI18n();
   const [view, setView] = useState<View>("home");
   const [inventory, setInventory] = useState<CodexInventory | null>(null);
+  const [projectFileScans, setProjectFileScans] = useState<Record<string, ProjectFileScanState>>({});
   const [loading, setLoading] = useState(true);
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [activeOperations, setActiveOperations] = useState(0);
@@ -73,6 +78,43 @@ function AppContent() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!inventory || inventory.projects.length === 0) return;
+
+    let active = true;
+    const projectIds = inventory.projects.map((project) => project.project_id);
+    const failedStates = () => Object.fromEntries(
+      projectIds.map((projectId) => [
+        projectId,
+        { status: "failed", project_id: projectId, message: "project file scan failed" } satisfies ProjectFileScanState,
+      ]),
+    );
+    setProjectFileScans(Object.fromEntries(
+      projectIds.map((projectId) => [
+        projectId,
+        { status: "scanning" } satisfies ProjectFileScanState,
+      ]),
+    ));
+
+    void scanProjectFiles(projectIds)
+      .then((results) => {
+        if (!active) return;
+        const next = failedStates();
+        const requested = new Set(projectIds);
+        for (const result of results) {
+          if (requested.has(result.project_id)) next[result.project_id] = result;
+        }
+        setProjectFileScans(next);
+      })
+      .catch(() => {
+        if (active) setProjectFileScans(failedStates());
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [inventory]);
 
   useEffect(() => {
     if (previousViewRef.current !== view) {
@@ -158,7 +200,7 @@ function AppContent() {
         </header>
 
         {view === "home" && <HomePage headingRef={headingRef} inventory={inventory} loading={loading} error={discoveryError} onNavigate={navigate} />}
-        {view === "send" && <SendPage headingRef={headingRef} inventory={inventory} onOperationStart={operationStarted} onOperationEnd={operationFinished} />}
+        {view === "send" && <SendPage headingRef={headingRef} inventory={inventory} projectFileScans={projectFileScans} onOperationStart={operationStarted} onOperationEnd={operationFinished} />}
         {view === "receive" && <ReceivePage headingRef={headingRef} inventory={inventory} onOperationStart={operationStarted} onOperationEnd={operationFinished} />}
         {view === "history" && <HistoryPage headingRef={headingRef} onOperationStart={operationStarted} onOperationEnd={operationFinished} />}
       </main>

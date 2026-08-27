@@ -61,6 +61,13 @@ pub struct ProjectEntry {
     pub git_head: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProjectFileScanResult {
+    Counted { project_id: Uuid, file_count: u64 },
+    Failed { project_id: Uuid, message: String },
+}
+
 fn project_source_available_by_default() -> bool {
     true
 }

@@ -17,6 +17,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             workflow::discover_codex,
+            workflow::scan_project_files,
             workflow::create_package,
             workflow::inspect_package,
             workflow::build_restore_plan,

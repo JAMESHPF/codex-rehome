@@ -4,17 +4,17 @@ pub use crate::workflow::*;
 mod tests {
     use crate::core::discovery::{discover_codex_with_context, DiscoveryContext};
     use crate::core::models::{
-        CodexInventory, ContentCounts, ConversationEntry, ProjectEntry, RecoveryStatus, SourceOs,
-        TransactionSummary,
+        CodexInventory, ContentCounts, ConversationEntry, ProjectEntry, ProjectFileScanResult,
+        RecoveryStatus, SourceOs, TransactionSummary,
     };
     use crate::core::package::{
         create_package as core_create_package, inspect_package as core_inspect_package,
     };
     use crate::workflow::{
         authorize_transaction_path, open_transaction_by_id, resolve_create_package_request,
-        rollback_transaction_by_id, validate_local_dialog_path, validate_rollback_action,
-        ApplyRestoreSelection, BuildRestorePlanRequest, CreatePackageSelection, RollbackAction,
-        WorkflowState,
+        rollback_transaction_by_id, scan_requested_projects, validate_local_dialog_path,
+        validate_rollback_action, ApplyRestoreSelection, BuildRestorePlanRequest,
+        CreatePackageSelection, RollbackAction, ScanProjectFilesRequest, WorkflowState,
     };
     use serde_json::json;
     use std::{
@@ -103,6 +103,12 @@ mod tests {
         });
         assert!(serde_json::from_value::<CreatePackageSelection>(selection).is_err());
 
+        let project_scan = json!({
+            "project_ids": [project_id],
+            "project_paths": ["C:\\private"]
+        });
+        assert!(serde_json::from_value::<ScanProjectFilesRequest>(project_scan).is_err());
+
         let build = json!({
             "action": "build",
             "package_selection_id": Uuid::new_v4(),
@@ -130,6 +136,63 @@ mod tests {
         assert!(
             validate_local_dialog_path(&PathBuf::from("\\\\server\\share\\handoff.rehome"))
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn project_scan_rejects_duplicate_ids_and_reports_unknown_ids() {
+        let (inventory, selected_project, _, _, _) = inventory_fixture();
+        let duplicate =
+            scan_requested_projects(&inventory, &[selected_project, selected_project]).unwrap_err();
+        assert_eq!(
+            duplicate.code,
+            crate::core::error::ErrorCode::ProjectConflict
+        );
+
+        let unknown = Uuid::new_v4();
+        assert_eq!(
+            scan_requested_projects(&inventory, &[unknown]).unwrap(),
+            vec![ProjectFileScanResult::Failed {
+                project_id: unknown,
+                message: "project is not in fresh discovery".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn project_scan_isolates_missing_and_failed_projects() {
+        let root = tempdir().expect("temporary root");
+        let available = root.path().join("available");
+        let failed = root.path().join("failed");
+        fs::create_dir_all(&available).expect("available project");
+        fs::write(available.join("README.md"), "readme").expect("project file");
+
+        let (mut inventory, available_id, _, _, _) = inventory_fixture();
+        let failed_id = inventory.projects[1].project_id;
+        inventory.projects[0].source_path = available.to_string_lossy().into_owned();
+        inventory.projects[1].source_path = failed.to_string_lossy().into_owned();
+
+        let results = scan_requested_projects(&inventory, &[available_id, failed_id]).unwrap();
+        assert_eq!(
+            results[0],
+            ProjectFileScanResult::Counted {
+                project_id: available_id,
+                file_count: 1,
+            }
+        );
+        assert!(matches!(
+            &results[1],
+            ProjectFileScanResult::Failed { project_id, message }
+                if *project_id == failed_id && message.contains("cannot be resolved")
+        ));
+
+        inventory.projects[1].source_available = false;
+        assert_eq!(
+            scan_requested_projects(&inventory, &[failed_id]).unwrap(),
+            vec![ProjectFileScanResult::Failed {
+                project_id: failed_id,
+                message: "project files are missing".into(),
+            }]
         );
     }
 

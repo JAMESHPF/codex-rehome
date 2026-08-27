@@ -3,6 +3,7 @@ const APP_SOURCE: &str = include_str!("../src/lib.rs");
 
 const COMMANDS: &[&str] = &[
     "discover_codex",
+    "scan_project_files",
     "create_package",
     "inspect_package",
     "build_restore_plan",
@@ -14,8 +15,8 @@ const COMMANDS: &[&str] = &[
 ];
 
 #[test]
-fn desktop_registers_exactly_the_nine_reviewed_commands() {
-    assert_eq!(WORKFLOW_SOURCE.matches("#[tauri::command]").count(), 9);
+fn desktop_registers_exactly_the_ten_reviewed_commands() {
+    assert_eq!(WORKFLOW_SOURCE.matches("#[tauri::command]").count(), 10);
     for command in COMMANDS {
         assert!(
             APP_SOURCE.contains(&format!("workflow::{command}")),

@@ -58,6 +58,14 @@ export interface ProjectEntry {
   git_head: string | null;
 }
 
+export type ProjectFileScanResult =
+  | { status: "counted"; project_id: string; file_count: number }
+  | { status: "failed"; project_id: string; message: string };
+
+export type ProjectFileScanState =
+  | { status: "scanning" }
+  | ProjectFileScanResult;
+
 export interface ConversationEntry {
   task_id: string;
   project_id: string | null;

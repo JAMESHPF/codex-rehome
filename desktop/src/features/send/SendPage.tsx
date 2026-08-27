@@ -23,11 +23,13 @@ import {
   type ConversationEntry,
   type CreatePackageReport,
   type OptionalContentEntry,
+  type ProjectFileScanState,
 } from "../../lib/types";
 
 interface SendPageProps {
   headingRef: RefObject<HTMLHeadingElement | null>;
   inventory: CodexInventory | null;
+  projectFileScans: Record<string, ProjectFileScanState>;
   onOperationStart: () => void;
   onOperationEnd: () => void;
 }
@@ -35,6 +37,7 @@ interface SendPageProps {
 export default function SendPage({
   headingRef,
   inventory,
+  projectFileScans,
   onOperationStart,
   onOperationEnd,
 }: SendPageProps) {
@@ -221,7 +224,7 @@ export default function SendPage({
               key={project.project_id}
               name={project.name}
               path={formatDisplayPath(project.source_path)}
-              fileCount={project.file_count}
+              fileScan={projectFileScans[project.project_id] ?? { status: "scanning" }}
               sourceAvailable={project.source_available}
               conversations={project.conversations}
               projectSelected={projects.has(project.project_id)}
@@ -238,7 +241,7 @@ export default function SendPage({
             <ProjectChoice
               name={t("未归属项目的对话")}
               path={t("只迁移对话，不包含项目文件")}
-              fileCount={null}
+              fileScan={null}
               conversations={unassociatedConversations}
               projectSelected={false}
               expanded={expanded.has("unassociated")}
@@ -339,7 +342,7 @@ export default function SendPage({
 interface ProjectChoiceProps {
   name: string;
   path: string;
-  fileCount: number | null;
+  fileScan: ProjectFileScanState | null;
   sourceAvailable?: boolean;
   conversations: ConversationEntry[];
   projectSelected: boolean;
@@ -351,10 +354,11 @@ interface ProjectChoiceProps {
   onSelectRecommended: () => void;
 }
 
-function ProjectChoice({ name, path, fileCount, sourceAvailable = true, conversations, projectSelected, expanded, selectedConversations, onToggleProject, onToggleExpanded, onToggleConversation, onSelectRecommended }: ProjectChoiceProps) {
+function ProjectChoice({ name, path, fileScan, sourceAvailable = true, conversations, projectSelected, expanded, selectedConversations, onToggleProject, onToggleExpanded, onToggleConversation, onSelectRecommended }: ProjectChoiceProps) {
   const { locale, t } = useI18n();
   const subagents = conversations.filter((conversation) => conversation.classification).length;
   const mainConversations = conversations.length - subagents;
+  const fileStatus = projectFileStatus(fileScan, sourceAvailable, t);
   return (
     <div className={`project-choice${sourceAvailable ? "" : " project-choice-missing"}`}>
       <div className="project-choice-header">
@@ -371,7 +375,10 @@ function ProjectChoice({ name, path, fileCount, sourceAvailable = true, conversa
           <span className="project-copy project-copy-unassociated"><strong>{name}</strong><small>{path}</small></span>
         )}
         <button className="project-expand" type="button" aria-expanded={expanded} aria-label={t(expanded ? "收起项目 {name}" : "展开项目 {name}", { name })} onClick={onToggleExpanded}>
-          <span>{t("{count} 个对话", { count: conversations.length })}{fileCount !== null && (sourceAvailable ? ` · ${fileCount ? t("{count} 个文件", { count: fileCount }) : t("已检测 个文件")}` : ` · ${t("项目文件缺失")}`)}</span>
+          <span>
+            {t("{count} 个对话", { count: conversations.length })}
+            {fileStatus && <> · <span className="project-file-status">{fileStatus}</span></>}
+          </span>
           {expanded ? <ChevronDown aria-hidden="true" /> : <ChevronRight aria-hidden="true" />}
         </button>
       </div>
@@ -402,6 +409,18 @@ function ProjectChoice({ name, path, fileCount, sourceAvailable = true, conversa
       )}
     </div>
   );
+}
+
+function projectFileStatus(
+  scan: ProjectFileScanState | null,
+  sourceAvailable: boolean,
+  t: (key: string, variables?: Record<string, string | number>) => string,
+): string | null {
+  if (scan === null) return null;
+  if (!sourceAvailable) return t("项目文件缺失");
+  if (scan.status === "scanning") return t("正在统计文件…");
+  if (scan.status === "failed") return t("文件统计失败");
+  return t("{count} 个文件", { count: scan.file_count });
 }
 
 interface OptionalContentGroupProps {

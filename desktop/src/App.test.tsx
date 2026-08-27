@@ -14,6 +14,7 @@ const api = vi.hoisted(() => ({
   openPath: vi.fn(),
   openRestoredThread: vi.fn(),
   rollbackTransaction: vi.fn(),
+  scanProjectFiles: vi.fn(),
   selectRestoreDestinations: vi.fn(),
 }));
 
@@ -274,6 +275,18 @@ beforeEach(() => {
     restored_files: 8,
     success: true,
   });
+  api.scanProjectFiles.mockResolvedValue([
+    {
+      status: "counted",
+      project_id: inventory.projects[0].project_id,
+      file_count: 12,
+    },
+    {
+      status: "counted",
+      project_id: inventory.projects[1].project_id,
+      file_count: 6,
+    },
+  ]);
   api.applyRestore.mockResolvedValue({
     transaction_id: committedTransaction.transaction_id,
     package_id: preview.manifest.package_id,
@@ -396,6 +409,87 @@ describe("ReHome Desktop workflows", () => {
 
     await user.click(screen.getByRole("button", { name: "展开项目 未归属项目的对话" }));
     expect(screen.getByRole("checkbox", { name: "选择对话 General workflow" })).toBeVisible();
+  });
+
+  it("shows cached background project counts including zero without rescanning on navigation", async () => {
+    const user = userEvent.setup();
+    const pending = deferred<Awaited<ReturnType<typeof api.scanProjectFiles>>>();
+    api.scanProjectFiles.mockReturnValue(pending.promise);
+    render(<App />);
+    await screen.findByText(inventory.codex_home);
+
+    await user.click(screen.getByRole("button", { name: "前往导出" }));
+    expect(screen.getAllByText("正在统计文件…")).toHaveLength(2);
+    const unassociated = screen.getByRole("button", { name: "展开项目 未归属项目的对话" });
+    expect(unassociated).toHaveTextContent("1 个对话");
+    expect(unassociated).not.toHaveTextContent("文件");
+
+    await act(async () => {
+      pending.resolve([
+        {
+          status: "counted",
+          project_id: inventory.projects[0].project_id,
+          file_count: 12,
+        },
+        {
+          status: "counted",
+          project_id: inventory.projects[1].project_id,
+          file_count: 0,
+        },
+      ]);
+      await pending.promise;
+    });
+
+    expect(screen.getByText("12 个文件")).toBeVisible();
+    expect(screen.getByText("0 个文件")).toBeVisible();
+    expect(api.scanProjectFiles).toHaveBeenCalledWith(
+      inventory.projects.map((project) => project.project_id),
+    );
+
+    await user.click(screen.getByRole("button", { name: "前往首页" }));
+    await user.click(screen.getByRole("button", { name: "前往导出" }));
+    expect(api.scanProjectFiles).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("0 个文件")).toBeVisible();
+  });
+
+  it("shows failed and missing project states in English", async () => {
+    const user = userEvent.setup();
+    api.discoverCodex.mockResolvedValue({
+      ...inventory,
+      projects: inventory.projects.map((project) =>
+        project.name === "notes" ? { ...project, source_available: false } : project,
+      ),
+    });
+    api.scanProjectFiles.mockResolvedValue([
+      {
+        status: "failed",
+        project_id: inventory.projects[0].project_id,
+        message: "permission denied",
+      },
+      {
+        status: "failed",
+        project_id: inventory.projects[1].project_id,
+        message: "project files are missing",
+      },
+    ]);
+    render(<App />);
+    await screen.findByText(inventory.codex_home);
+
+    await user.click(screen.getByRole("button", { name: "Switch to English" }));
+    await user.click(screen.getByRole("button", { name: "Go to Export" }));
+
+    expect(await screen.findByText("File count failed")).toBeVisible();
+    expect(screen.getByText("Project files missing")).toBeVisible();
+  });
+
+  it("marks every available project failed when the background command rejects", async () => {
+    const user = userEvent.setup();
+    api.scanProjectFiles.mockRejectedValue(new Error("discovery failed"));
+    render(<App />);
+    await screen.findByText(inventory.codex_home);
+    await user.click(screen.getByRole("button", { name: "前往导出" }));
+
+    expect(await screen.findAllByText("文件统计失败")).toHaveLength(2);
   });
 
   it("expands a project without selecting its files", async () => {
