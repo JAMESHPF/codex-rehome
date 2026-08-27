@@ -51,7 +51,7 @@ If a shared Skill contains a symlink, reparse point, special file, sensitive aut
 
 This is not official cloud sync and it does not automatically keep two computers synchronized each day. After a cross-platform move, an old conversation can remain useful historical context while its original working-directory handle no longer works. Reopen the restored project, then continue in a new task when needed.
 
-Each `.rehome` package and individual file can currently be up to 16 GiB. Large files are streamed during creation, inspection, and restore instead of being loaded entirely into memory. Codex thread metadata has a separate 64 MiB limit.
+Each `.rehome` package, individual file, and single Codex conversation can currently be up to 16 GiB. Large files are streamed during creation, inspection, and restore. If a conversation exceeds that limit, split it or leave it unselected.
 
 Login sessions, browser state, running terminals, unsaved work, and native system dependencies are not fully portable. Different accounts or workspaces may require fresh sign-in or authorization for external services.
 

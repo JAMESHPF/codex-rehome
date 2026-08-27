@@ -37,16 +37,21 @@ use zip::{write::SimpleFileOptions, CompressionMethod, DateTime, ZipArchive, Zip
 const FORMAT: &str = "codex-rehome";
 const SCHEMA_VERSION_V1: u32 = 1;
 const SCHEMA_VERSION_V2: u32 = 2;
-const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 const MAX_CONTROL_FILE_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_PLANNING_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+// Keep the planning limit aligned with the package's existing per-file and
+// total-size safety ceiling. This lets a large Codex conversation be checked
+// and path-rewritten instead of being rejected by a smaller legacy limit.
+const MAX_PLANNING_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_INSPECTION_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = MAX_INSPECTION_BYTES;
 const MAX_ARCHIVE_FILE_BYTES: u64 = 2 * MAX_INSPECTION_BYTES;
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_JSONL_LINE_BYTES: usize = 1024 * 1024;
-const MAX_SOURCE_COPY_ATTEMPTS: usize = 3;
-const SOURCE_COPY_RETRY_DELAY: Duration = Duration::from_millis(50);
+// Codex keeps updating its session index while the app is open. Give a
+// transient write enough time to settle before treating it as a failed pack.
+const MAX_SOURCE_COPY_ATTEMPTS: usize = 8;
+const SOURCE_COPY_RETRY_DELAY: Duration = Duration::from_millis(200);
 const THREAD_EXPORT_COLUMNS_V1: &[&str] = &[
     "id",
     "cwd",
@@ -286,6 +291,13 @@ pub(crate) struct VerifiedPackage {
     pub preview: PackagePreview,
     pub payloads: BTreeMap<String, VerifiedPayload>,
     pub planning_payloads: BTreeMap<String, Vec<u8>>,
+    pub(crate) archive_size_bytes: u64,
+    pub(crate) archive_modified: SystemTime,
+}
+
+pub(crate) struct AuthenticatedPayloadArchive<'a> {
+    verified: &'a VerifiedPackage,
+    archive: ZipArchive<fs::File>,
 }
 
 impl VerifiedPackage {
@@ -310,15 +322,19 @@ impl VerifiedPackage {
         Ok(bytes)
     }
 
-    pub(crate) fn write_authenticated_payload<W: Write>(
+    pub(crate) fn open_payload_archive(
         &self,
-        source: &str,
-        writer: &mut W,
-    ) -> Result<u64, RehomeError> {
-        let verified = self
-            .payloads
-            .get(source)
-            .ok_or_else(|| package_invalid("restore operation references a missing payload"))?;
+    ) -> Result<AuthenticatedPayloadArchive<'_>, RehomeError> {
+        let metadata = fs::metadata(&self.preview.package_path)
+            .map_err(|error| package_invalid(format!("could not inspect package: {error}")))?;
+        if !metadata.is_file()
+            || metadata.len() != self.archive_size_bytes
+            || metadata.modified().map_err(io_package_error)? != self.archive_modified
+        {
+            return Err(package_invalid(
+                "package archive changed after restore planning",
+            ));
+        }
         let mut file = fs::File::open(&self.preview.package_path)
             .map_err(|error| package_invalid(format!("could not reopen package: {error}")))?;
         let archive_hash = hash_archive_file(&mut file)?;
@@ -327,17 +343,35 @@ impl VerifiedPackage {
                 "package archive changed after restore planning",
             ));
         }
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| package_invalid(format!("could not rewind package: {error}")))?;
+        let archive = ZipArchive::new(file)
+            .map_err(|error| package_invalid(format!("invalid ZIP container: {error}")))?;
+        Ok(AuthenticatedPayloadArchive {
+            verified: self,
+            archive,
+        })
+    }
+}
+
+impl AuthenticatedPayloadArchive<'_> {
+    pub(crate) fn write_payload<W: Write>(
+        &mut self,
+        source: &str,
+        writer: &mut W,
+    ) -> Result<u64, RehomeError> {
+        let verified = self
+            .verified
+            .payloads
+            .get(source)
+            .ok_or_else(|| package_invalid("restore operation references a missing payload"))?;
         if let Some(bytes) = verified.inline_bytes.as_ref() {
             authenticate_payload_bytes(bytes, verified)?;
             writer.write_all(bytes).map_err(io_package_error)?;
             return Ok(bytes.len() as u64);
         }
-        file.seek(SeekFrom::Start(0))
-            .map_err(|error| package_invalid(format!("could not rewind package: {error}")))?;
-        let mut archive = ZipArchive::new(file)
-            .map_err(|error| package_invalid(format!("invalid ZIP container: {error}")))?;
         let archive_name = verified.archive_name.as_deref().unwrap_or(source);
-        let mut entry = archive.by_name(archive_name).map_err(|error| {
+        let mut entry = self.archive.by_name(archive_name).map_err(|error| {
             package_invalid(format!(
                 "could not reopen verified payload {source}: {error}"
             ))
@@ -357,6 +391,10 @@ pub(crate) fn inspect_package_for_planning(path: &Path) -> Result<VerifiedPackag
     if let Some(package) = crate::core::legacy::inspect_schema_v3(path)? {
         return Ok(package);
     }
+    let archive_metadata = fs::metadata(path)
+        .map_err(|error| package_invalid(format!("could not inspect package: {error}")))?;
+    let archive_size_bytes = archive_metadata.len();
+    let archive_modified = archive_metadata.modified().map_err(io_package_error)?;
     let mut file = fs::File::open(path)
         .map_err(|error| package_invalid(format!("could not open package: {error}")))?;
     let archive_hash = hash_archive_file(&mut file)?;
@@ -364,11 +402,7 @@ pub(crate) fn inspect_package_for_planning(path: &Path) -> Result<VerifiedPackag
         .map_err(|error| package_invalid(format!("could not rewind package: {error}")))?;
     let mut archive = ZipArchive::new(file)
         .map_err(|error| package_invalid(format!("invalid ZIP container: {error}")))?;
-    if archive.len() > MAX_ARCHIVE_ENTRIES {
-        return Err(package_invalid(
-            "ZIP entry count exceeds the inspection limit",
-        ));
-    }
+    ensure_archive_entry_count(archive.len())?;
 
     let mut names = Vec::with_capacity(archive.len());
     let mut paths = PortablePathRegistry::default();
@@ -518,6 +552,8 @@ pub(crate) fn inspect_package_for_planning(path: &Path) -> Result<VerifiedPackag
         },
         payloads,
         planning_payloads,
+        archive_size_bytes,
+        archive_modified,
     })
 }
 
@@ -811,6 +847,15 @@ fn read_selected_session_index(
     let Some(path) = path else {
         return Ok(SessionIndexMetadata::default());
     };
+    retry_stable_copy(path, || {
+        read_selected_session_index_once(path, selected_ids)
+    })
+}
+
+fn read_selected_session_index_once(
+    path: &Path,
+    selected_ids: &[Uuid],
+) -> Result<StableCopyAttempt<SessionIndexMetadata>, RehomeError> {
     let selected: HashSet<Uuid> = selected_ids.iter().copied().collect();
     let mut result = SessionIndexMetadata::default();
     let before = source_fingerprint(path)?;
@@ -834,11 +879,9 @@ fn read_selected_session_index(
         }
     }
     if before != source_fingerprint(path)? {
-        return Err(package_invalid(
-            "source file changed in size or modification time while being read",
-        ));
+        return Ok(StableCopyAttempt::Changed);
     }
-    Ok(result)
+    Ok(StableCopyAttempt::Complete(result))
 }
 
 fn export_selected_threads(
@@ -1235,7 +1278,7 @@ fn retry_stable_copy<T>(
             }
             StableCopyAttempt::Changed => {
                 return Err(package_invalid(format!(
-                    "source file kept changing while being copied after {MAX_SOURCE_COPY_ATTEMPTS} attempts: {}",
+                    "source file kept changing while being packaged after {MAX_SOURCE_COPY_ATTEMPTS} attempts: {}; close Codex or retry after it finishes saving",
                     source.display()
                 )));
             }
@@ -1409,6 +1452,15 @@ fn format_package_bytes(bytes: u64) -> String {
     }
 }
 
+fn ensure_archive_entry_count(count: usize) -> Result<(), RehomeError> {
+    if count > MAX_ARCHIVE_ENTRIES {
+        return Err(package_invalid(format!(
+            "package contains {count} entries and exceeds the {MAX_ARCHIVE_ENTRIES} entry limit; deselect generated or dependency files and try again"
+        )));
+    }
+    Ok(())
+}
+
 fn checked_staged_total_bytes(current: u64, next: u64) -> Result<u64, RehomeError> {
     let total = current.checked_add(next).ok_or_else(|| {
         package_invalid(format!(
@@ -1475,11 +1527,7 @@ fn staged_archive_entries(
             return Err(package_invalid("staging contains a non-regular entry"));
         }
     }
-    if entries.len() > MAX_ARCHIVE_ENTRIES {
-        return Err(package_invalid(
-            "staged package entry count exceeds the limit",
-        ));
-    }
+    ensure_archive_entry_count(entries.len())?;
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(entries)
 }
@@ -1909,6 +1957,13 @@ mod authenticated_payload_tests {
     }
 
     #[test]
+    fn package_entry_limit_accepts_large_real_projects() {
+        ensure_archive_entry_count(50_000).unwrap();
+        ensure_archive_entry_count(MAX_ARCHIVE_ENTRIES).unwrap();
+        ensure_archive_entry_count(MAX_ARCHIVE_ENTRIES + 1).unwrap_err();
+    }
+
+    #[test]
     fn staged_total_size_error_reports_the_actual_size_and_limit() {
         let actual = MAX_INSPECTION_BYTES + 1;
 
@@ -1928,10 +1983,17 @@ mod authenticated_payload_tests {
     }
 
     #[test]
-    fn thread_metadata_uses_the_larger_planning_payload_limit() {
+    fn thread_metadata_uses_the_package_planning_payload_limit() {
         ensure_control_size("manifest.json", MAX_CONTROL_FILE_BYTES + 1).unwrap_err();
         ensure_planning_payload_size("codex/metadata/threads.json", MAX_CONTROL_FILE_BYTES + 1)
             .unwrap();
+        ensure_planning_payload_size("codex/sessions/large-rollout.jsonl", 64 * 1024 * 1024 + 1)
+            .unwrap();
+        ensure_planning_payload_size(
+            "codex/sessions/ten-gib-rollout.jsonl",
+            10 * 1024 * 1024 * 1024,
+        )
+        .unwrap();
         ensure_planning_payload_size(
             "codex/metadata/threads.json",
             MAX_PLANNING_PAYLOAD_BYTES + 1,

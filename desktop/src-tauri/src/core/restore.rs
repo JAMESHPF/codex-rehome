@@ -16,7 +16,7 @@ use crate::core::{
         RollbackReport, SkillLockFileV3, SourceOs, TransactionHistory, TransactionSummary,
         VerificationReport, VerificationStatus,
     },
-    package::{inspect_package_for_planning, VerifiedPackage},
+    package::{inspect_package_for_planning, AuthenticatedPayloadArchive, VerifiedPackage},
     paths::normalize_entry,
     shared_skills::{merge_skill_lock, tree_hash, LockMergeResult},
     stable_fs::PinnedParent,
@@ -326,6 +326,7 @@ fn apply_regular_files(
 ) -> Result<(u64, u64), RehomeError> {
     let mut restored_files = 0_u64;
     let mut restored_bytes = 0_u64;
+    let mut payload_archive = verified.open_payload_archive()?;
     for kind in [
         OperationKind::File,
         OperationKind::SkillBundle,
@@ -343,10 +344,8 @@ fn apply_regular_files(
                     let mut staged = NamedTempFile::new().map_err(|error| {
                         restore_failed(format!("could not stage restored payload: {error}"))
                     })?;
-                    let bytes = verified.write_authenticated_payload(
-                        &operation.package_source,
-                        staged.as_file_mut(),
-                    )?;
+                    let bytes = payload_archive
+                        .write_payload(&operation.package_source, staged.as_file_mut())?;
                     staged.as_file().sync_all().map_err(|error| {
                         restore_failed(format!("could not flush restored payload: {error}"))
                     })?;
@@ -360,9 +359,14 @@ fn apply_regular_files(
                     record_applied_mutation(transaction, &operation.target)?;
                     (1, bytes)
                 }
-                OperationKind::SkillBundle => {
-                    apply_skill_bundle(plan, verified, operation, transaction, fault)?
-                }
+                OperationKind::SkillBundle => apply_skill_bundle(
+                    plan,
+                    verified,
+                    &mut payload_archive,
+                    operation,
+                    transaction,
+                    fault,
+                )?,
                 OperationKind::SkillLock => {
                     let bytes = apply_skill_lock(plan, verified, operation, transaction, fault)?;
                     (1, bytes)
@@ -382,6 +386,7 @@ fn apply_regular_files(
 fn apply_skill_bundle(
     plan: &RestorePlan,
     verified: &VerifiedPackage,
+    payload_archive: &mut AuthenticatedPayloadArchive<'_>,
     operation: &crate::core::models::PlannedOperation,
     transaction: &mut PreparedTransaction,
     fault: &mut impl FnMut(RestoreFaultPoint) -> Result<(), RehomeError>,
@@ -468,7 +473,7 @@ fn apply_skill_bundle(
                 .map_err(|error| {
                     restore_failed(format!("could not create staged Skill file: {error}"))
                 })?;
-            let written = verified.write_authenticated_payload(source, &mut output)?;
+            let written = payload_archive.write_payload(source, &mut output)?;
             output.sync_all().map_err(|error| {
                 restore_failed(format!("could not flush staged Skill file: {error}"))
             })?;
